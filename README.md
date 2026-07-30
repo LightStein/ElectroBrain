@@ -1,0 +1,70 @@
+# ElectroBrain
+
+A Telegram assistant that answers questions about electrical and fire-safety
+standards from a private corpus of ~160 PDF/DOCX documents (Russian + English),
+running entirely on one Windows laptop.
+
+Built for George, an electrical revisor who currently spends 4–5 hours hunting
+through standards for a single answer.
+
+```
+Telegram ──► bot.js ──► bridge-server.js ──► ask.py ──► Ollama (qwen3:4b)
+                                               │
+                                               ├─ index/catalog.md      (which docs?)
+                                               ├─ index/docs/*/full.md  (grep + rank)
+                                               └─ claude -p haiku       (escalation)
+```
+
+**Every answer cites its source** — document title, clause number, and a verbatim
+quote. For a revisor an uncited answer is a liability, so both engine prompts
+enforce it and refuse rather than guess.
+
+## How it works
+
+**Preprocessing** (one time, plus one click per document change). Free tools do
+the heavy lifting: pymupdf classifies each PDF as digital or scanned, OCRmyPDF
+(Tesseract `rus+eng`) handles the scans, pandoc handles DOCX. Claude Code CLI
+then does cheap text-in/text-out cleanup — clean Markdown with clause numbering
+preserved, plus a metadata file with Russian *and* English keywords, which is
+what makes a Russian question find an English document.
+
+**Answering** (every message, local). Three stages: qwen picks candidate
+documents from a ~160-line catalog and generates bilingual search terms; a
+lexical pass scores heading-delimited chunks of just those documents; qwen
+answers from the top chunks with mandatory citations. Hard questions, or any
+message with an image, escalate to `claude -p`.
+
+**Delivery.** The Telegram gateway is a port of a battle-tested Linux/Docker
+bridge (see `gateway/`) to native Windows services under NSSM — durable reply
+handoff, drained restarts, and three watchdog layers against long-poll wedges,
+all carried over from lessons that cost real outages in the original.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `bot/ask.py` | The answering engine — routing, retrieval, citation, escalation |
+| `gateway/` | Telegram bot + per-project bridge (named pipes on Windows) |
+| `pipeline/update.py` | Scan → extract → OCR → cleanup, manifest-driven and resumable |
+| `ops/install.ps1` | Registers the NSSM services |
+| `ops/ctl.ps1` | `status` / `start` / `stop` / `restart-when-idle` / `logs` / `ask` |
+| `ops/laptop-setup/` | One-shot SSH + Cloudflare tunnel setup for the laptop |
+| `Update-Standards.bat` | George's single button after adding or removing a document |
+| `PLAN.md` | Full design, decisions, test results, remaining phases |
+
+Deploys to `C:\Standards\` on the laptop; `index\` doubles as an Obsidian vault
+so the corpus stays browsable by hand.
+
+## Setup
+
+1. `ops/laptop-setup/README.md` — remote access (Cloudflare tunnel + SSH)
+2. `PLAN.md` → Phase 1 — Ollama, Python, OCR tooling, Node, NSSM, Claude CLI
+3. `python pipeline/update.py --scan-only` — review the inventory report first
+4. `python pipeline/update.py` — extract, OCR, and build the index
+5. `ops/install.ps1` — bring the Telegram gateway up
+
+## Secrets
+
+Nothing sensitive is tracked. `ops/laptop-setup/setup-access.ps1` (Cloudflare
+tunnel token) and `secrets.env` (Telegram bot token) are gitignored — copy
+`setup-access.ps1.example` and fill it in locally.

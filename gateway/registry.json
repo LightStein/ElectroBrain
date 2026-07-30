@@ -1,0 +1,11 @@
+{
+  "_comment": "Per-project routing (bot.js reads this at boot). On Windows, socket is a named pipe; on Linux (dev testing) a unix socket path. upload is a single directory (native deployment = one path world). Set chatId after /chatid in George's group.",
+  "projects": [
+    {
+      "name": "standards",
+      "chatId": 0,
+      "socket": "\\\\.\\pipe\\standards-bridge",
+      "upload": "C:\\Standards\\bot\\uploads"
+    }
+  ]
+}

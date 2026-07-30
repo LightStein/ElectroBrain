@@ -1,0 +1,26 @@
+# ── secrets ──────────────────────────────────────────────────────────────────
+# The filled-in setup script carries a live Cloudflare tunnel token (a
+# credential — anyone holding it can run a connector for the tunnel). Only the
+# .example template is tracked; copy it and fill the token locally.
+ops/laptop-setup/setup-access.ps1
+secrets.env
+*.pem
+*.key
+id_ed25519*
+
+# ── runtime state (lives on George's laptop, never in the repo) ──────────────
+raw/
+work/
+index/
+state/
+logs/
+gateway/run/
+gateway/uploads/
+bot/uploads/
+bot/.progress
+
+# ── deps / build ─────────────────────────────────────────────────────────────
+node_modules/
+package-lock.json
+__pycache__/
+*.pyc
