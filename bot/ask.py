@@ -55,10 +55,16 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.environ.get("ASK_MODEL", "qwen3:4b-instruct")
 NUM_CTX = int(os.environ.get("ASK_NUM_CTX", "16384"))
 HISTORY_FILE = os.environ.get("ASK_HISTORY_FILE", os.path.join(ROOT, "state", "ask-history.json"))
-MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "12000"))
+# At the measured ~114 tok/s prompt processing, 12000 chars of context was
+# ~5000 tokens = ~44s of prompt processing before generation even begins.
+# 6000 keeps the answer call inside a usable chat latency.
+MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "6000"))
 # Off by default: the default model has no thinking mode to enable.
 THINK_FINAL = os.environ.get("ASK_THINK_FINAL", "0") == "1"
 AUTO_ESCALATE = os.environ.get("ASK_AUTO_ESCALATE", "0") == "1"
+# "lexical" (default) routes without a model - see stage A. "llm" keeps the
+# original catalog-in-prompt router, retained for comparison.
+ROUTER = os.environ.get("ASK_ROUTER", "lexical")
 CLAUDE_MODEL = os.environ.get("ASK_CLAUDE_MODEL", "haiku")
 PRO_PROMPT_FILE = os.environ.get("ASK_PRO_PROMPT", os.path.join(SCRIPT_DIR, "pro-prompt.md"))
 
@@ -134,7 +140,112 @@ def ollama_chat(messages, think, want_json=False, timeout=300):
     return content
 
 
-# ------------------------------------------------------------ stage A: route
+
+# ------------------------------------------------- stage A: lexical routing
+#
+# Measured on the real corpus: embedding the 56-document catalog in a routing
+# prompt costs 8,575 tokens, and this GPU processes prompts at ~114 tok/s -
+# 83 SECONDS per question, before the answer call even starts. Worse, if the
+# catalog ever exceeds num_ctx, Ollama returns 400 and every question fails
+# outright rather than degrading.
+#
+# So routing is done without a model. meta.json carries ALIGNED RU/EN keyword
+# pairs (keywords_ru[i] and keywords_en[i] are the same concept), which is
+# exactly the translation table needed: a Russian question token that matches
+# a Russian keyword contributes its English twin as a search term. That was
+# the only thing the LLM call was really needed for.
+
+STOPWORDS = {
+    "какой", "какая", "какое", "какие", "какого", "каком", "чему", "чего",
+    "который", "должен", "должна", "должно", "нужно", "надо", "можно",
+    "быть", "если", "или", "для", "при", "над", "под", "это", "как",
+    "что", "где", "когда", "почему", "сколько", "ставить", "делать",
+    "what", "which", "the", "and", "for", "with", "from", "should", "must",
+}
+
+
+def norm_token(w):
+    """Crude Russian stemming: drop the inflected tail.
+
+    A full morphological analyser would be better, but this is a keyword
+    match, not parsing - "заземления"/"заземление"/"заземлению" all need to
+    collide, and cutting the last two characters of a long word does that
+    without a dependency.
+    """
+    w = w.lower().strip("«»\"'(),.;:!?-—")
+    if len(w) > 6 and re.search(r"[а-яё]", w):
+        return w[:-2]
+    return w
+
+
+def question_tokens(question):
+    raw = re.findall(r"[\wа-яёА-ЯЁ]{3,}", question.lower())
+    return {norm_token(w) for w in raw if w not in STOPWORDS}
+
+
+def load_meta_index():
+    """doc_id -> meta dict, for every indexed document."""
+    out = {}
+    if not os.path.isdir(DOCS_DIR):
+        return out
+    for doc_id in os.listdir(DOCS_DIR):
+        mp = os.path.join(DOCS_DIR, doc_id, "meta.json")
+        try:
+            with open(mp, encoding="utf-8") as f:
+                out[doc_id] = json.load(f)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def route_lexical(question, metas, max_docs=12):
+    """Pick candidate documents and build bilingual search terms, no model."""
+    qt = question_tokens(question)
+    scored, terms = [], set(re.findall(r"[\wа-яёА-ЯЁ]{4,}", question.lower()))
+
+    for doc_id, meta in metas.items():
+        ru = meta.get("keywords_ru") or []
+        en = meta.get("keywords_en") or []
+        topics = meta.get("topics") or []
+        title = meta.get("title") or ""
+
+        score, hits = 0.0, []
+        # Keywords are the strongest signal, and the aligned pair gives us the
+        # other language for free.
+        for i, kw in enumerate(ru):
+            if any(t in norm_token(kw) or norm_token(kw) in t for t in qt if len(t) > 3):
+                score += 3.0
+                hits.append(kw)
+                if i < len(en):
+                    hits.append(en[i])       # the aligned English twin
+        for i, kw in enumerate(en):
+            if any(t in kw.lower() or kw.lower() in t for t in qt if len(t) > 3):
+                score += 3.0
+                hits.append(kw)
+                if i < len(ru):
+                    hits.append(ru[i])
+        for t in topics:
+            tl = t.lower()
+            if any(q in tl for q in qt if len(q) > 3):
+                score += 1.5
+                hits.append(t)
+        tl = title.lower()
+        if any(q in tl for q in qt if len(q) > 3):
+            score += 1.0
+
+        if score > 0:
+            scored.append((score, doc_id, hits))
+
+    scored.sort(key=lambda x: -x[0])
+    top = scored[:max_docs]
+    for _, _, hits in top:
+        terms.update(h for h in hits if len(h) > 2)
+    doc_ids = [d for _, d, _ in top]
+    # No keyword hit anywhere: fall back to scanning everything rather than
+    # answering "not found" from an empty shortlist.
+    return sorted(terms), doc_ids
+
+# ------------------------------------------- stage A (legacy): LLM routing
 
 ROUTE_SYSTEM = """Ты — маршрутизатор вопросов к каталогу нормативных документов \
 (электрика, пожарные системы, заземление, молниезащита и т.п.). Документы на \
@@ -459,7 +570,10 @@ def main():
               "Запусти Update-Standards или обратись к Анри.")
         return
 
-    terms, doc_ids = route(question, catalog_text, history)
+    if ROUTER == "llm":
+        terms, doc_ids = route(question, catalog_text, history)
+    else:
+        terms, doc_ids = route_lexical(question, load_meta_index())
     # Small models occasionally hallucinate ids — keep only real ones. An empty
     # list makes retrieve() scan the whole corpus, which is the safe fallback.
     doc_ids = [d for d in doc_ids if d in titles]
