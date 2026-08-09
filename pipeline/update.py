@@ -2,12 +2,21 @@
 """update.py — the whole document pipeline, resumable, driven by a manifest.
 
 Stages per document (recorded in state/manifest.json, safe to re-run anytime):
-  scan       hash raw/ files, classify PDFs text/scanned/mixed, detect language
-  extract    digital PDF -> pymupdf text; DOCX -> pandoc markdown
-  ocr        scanned/mixed PDF -> ocrmypdf (tesseract rus+eng) -> text
-  cleanup    claude -p turns extracted text into index/docs/<id>/full.md
-             + meta.json + a catalog.md line (see cleanup-prompt.md)
-  (removal)  files deleted from raw/ -> their index entries are removed
+  scan       hash files, classify PDFs text/scanned/mixed, detect language
+  extract    digital PDF -> pymupdf; docx/odt -> pandoc; legacy .doc ->
+             LibreOffice -> pandoc; scanned PDF -> ocrmypdf (tesseract rus+eng)
+  markdown   MECHANICAL, no model: strip page furniture and watermarks, join
+             hyphenated line breaks, promote clause numbers to headings ->
+             index/docs/<id>/full.md, wording left verbatim
+  meta       claude -p reads a SAMPLE and writes only meta.json + a catalog
+             line (see cleanup-prompt.md)
+  (removal)  files deleted from the raw folder -> index entries removed
+
+Why the split: this corpus is 16.3M chars (~5.4M tokens). Having a model
+rewrite all of it would take days, exhaust plan limits, and let it silently
+"correct" clause numbers and measurements - unacceptable when a revisor cites
+them. So the text stays verbatim and the model is used only for judgement:
+titles, topics, and aligned RU/EN keywords for cross-language search.
 
 Usage:
   python update.py                 run everything that's pending
@@ -46,6 +55,10 @@ STATE = os.path.join(ROOT, "state")
 MANIFEST = os.path.join(STATE, "manifest.json")
 REPORT = os.path.join(STATE, "inventory_report.md")
 CLEANUP_PROMPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleanup-prompt.md")
+# Opening slice handed to Claude for metadata. Standards state their title,
+# scope and contents up front, so this is plenty and keeps the pass cheap.
+SAMPLE_CHARS = int(os.environ.get("STANDARDS_SAMPLE_CHARS", "14000"))
+META_MODEL = os.environ.get("STANDARDS_META_MODEL", "haiku")
 
 # .xodt is not a real format - it is an ODT with a typo'd extension, and
 # George's corpus contains one. Identified by magic bytes, handled as odt.
@@ -329,51 +342,155 @@ def extract_doc(path, doc_id):
     return "\n\n".join(p.text for p in d.paragraphs)
 
 
+
+# ---------------------------------------------- stage: mechanical markdown
+
+PAGE_RE = re.compile(r"\[\[page (\d+)\]\]")
+# "1.1.29 Title", "5.2. Title", "10.12 Title" - the clause numbering a revisor
+# actually cites. Promoting these to headings is what makes retrieval work at
+# all: ask.py splits documents on Markdown headings, so without them a
+# 3.4M-char file is one undifferentiated blob.
+CLAUSE_RE = re.compile(r"^(\d+(?:\.\d+){0,3})[.)]?\s+(\S.{0,120})$")
+SECTION_RE = re.compile(r"^(Приложение|ПРИЛОЖЕНИЕ|Раздел|РАЗДЕЛ|Annex|Section)\b.{0,80}$")
+HYPHEN_RE = re.compile(r"(\w)[-­]\n(\w)")
+
+
+def page_furniture(pages):
+    """Lines repeated across many pages: watermarks, running heads, footers.
+
+    One document here carries "Электротехническая библиотека Elec.ru" twice on
+    every page. Left in, it pollutes retrieval and wastes context on every
+    chunk that quotes it.
+    """
+    seen = {}
+    for pg in pages:
+        for line in {l.strip() for l in pg.split("\n") if l.strip()}:
+            if len(line) < 90:
+                seen[line] = seen.get(line, 0) + 1
+    threshold = max(3, int(len(pages) * 0.3))
+    return {l for l, n in seen.items() if n >= threshold}
+
+
+def to_markdown(text, title):
+    pages = PAGE_RE.split(text)
+    # split() yields [pre, num, body, num, body, ...] - keep the bodies
+    bodies = pages[2::2] if len(pages) > 1 else pages
+    junk = page_furniture(bodies) if len(bodies) > 2 else set()
+
+    text = "\n".join(bodies)
+    text = HYPHEN_RE.sub(r"\1\2", text)          # join hyphenated line breaks
+
+    out, blank = [f"# {title}", ""], False
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if not blank:
+                out.append("")
+            blank = True
+            continue
+        if stripped in junk or stripped.isdigit():
+            continue                              # watermark / bare page number
+        blank = False
+        if SECTION_RE.match(stripped):
+            out.append(f"\n## {stripped}\n")
+        elif CLAUSE_RE.match(stripped):
+            out.append(f"\n### {stripped}\n")
+        else:
+            out.append(line)
+    md = "\n".join(out)
+    return re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
+
+
+def stage_markdown(m):
+    """extracted .txt -> index/docs/<id>/full.md, with NO model involved.
+
+    The corpus is 16.3M chars (~5.4M tokens). Rewriting that through Claude
+    would take days, exhaust plan limits, and - worse for a revisor - let a
+    model silently "correct" clause numbers and measurements. The extracted
+    text is already the document's own text layer, so the honest thing is to
+    clean it structurally and keep the wording verbatim, which is exactly
+    what a citation needs.
+    """
+    for name, r in m["files"].items():
+        if r["status"] != "extracted":
+            continue
+        src = os.path.join(EXTRACTED, r["doc_id"] + ".txt")
+        if not os.path.isfile(src):
+            continue
+        with open(src, encoding="utf-8") as f:
+            text = f.read()
+        title = os.path.splitext(name)[0]
+        out_dir = os.path.join(DOCS, r["doc_id"])
+        os.makedirs(out_dir, exist_ok=True)
+        md = to_markdown(text, title)
+        with open(os.path.join(out_dir, "full.md"), "w", encoding="utf-8") as f:
+            f.write(md)
+        r["status"] = "markdown"
+        r["md_chars"] = len(md)
+        headings = md.count("\n### ") + md.count("\n## ")
+        log(f"markdown: {r['doc_id']} -> {len(md)} chars, {headings} headings")
+    save_manifest(m)
+
 # ------------------------------------------------------------- cleanup
 
-def stage_cleanup(m, limit=None):
-    """claude -p per document: extracted text -> clean full.md + meta.json +
-    catalog line. Resumable; a failed doc stays 'extracted' for the next run."""
+def stage_meta(m, limit=None):
+    """Claude produces ONLY meta.json + the catalog line, from a sample.
+
+    It never sees or rewrites the whole document: full.md is built
+    mechanically (see stage_markdown). What a model is genuinely needed for
+    here is judgement - the official title, the topics, and RU/EN keyword
+    synonyms that let a Russian question find an English document. That is a
+    few hundred output tokens per doc instead of rewriting millions.
+    """
     if not CLAUDE_EXE:
-        log("cleanup: claude CLI not found - install it and log in, then "
-            "re-run. Extraction/OCR results are kept, nothing is lost.")
+        log("meta: claude CLI not found - install it and log in, then re-run. "
+            "full.md files are already built, so nothing is lost.")
         return
     with open(CLEANUP_PROMPT, encoding="utf-8") as f:
         sys_prompt = f.read()
-    todo = [(n, r) for n, r in m["files"].items() if r["status"] == "extracted"]
+    todo = [(n, r) for n, r in m["files"].items() if r["status"] == "markdown"]
     if limit:
         todo = todo[:limit]
+    log(f"meta: {len(todo)} document(s) to describe")
     for name, r in todo:
         doc_id = r["doc_id"]
-        src_txt = os.path.join(EXTRACTED, doc_id + ".txt")
         out_dir = os.path.join(DOCS, doc_id)
-        os.makedirs(out_dir, exist_ok=True)
-        task = (f"Process one document.\n"
+        md_path = os.path.join(out_dir, "full.md")
+        # A sample is enough: standards put the title, scope and contents up
+        # front. Reading 3.4M chars of ПУЭ-7 to name it would be absurd.
+        try:
+            with open(md_path, encoding="utf-8") as f:
+                sample = f.read(SAMPLE_CHARS)
+        except OSError:
+            continue
+        sample_file = os.path.join(WORK, "sample.txt")
+        with open(sample_file, "w", encoding="utf-8") as f:
+            f.write(sample)
+        task = (f"Describe one document.\n"
                 f"- Original filename: {name}\n"
                 f"- doc id: {doc_id}\n"
                 f"- Language guess: {r.get('lang')}\n"
-                f"- Was OCR used: {'yes' if r['kind'] in ('scanned', 'mixed') else 'no'}\n"
-                f"- Extracted text: {src_txt}\n"
-                f"- Write to: {out_dir}\\full.md and {out_dir}\\meta.json\n"
+                f"- Full text (already built, do NOT rewrite it): {md_path}\n"
+                f"- A sample of its opening is at: {sample_file}\n"
+                f"- Write ONLY: {out_dir}\\meta.json\n"
                 f"- Then append/replace this doc's line in {CATALOG}\n")
-        log(f"cleanup: {doc_id} ({name}) ...")
         cmd = [CLAUDE_EXE, "--print", "--dangerously-skip-permissions",
-               "--append-system-prompt", sys_prompt, "-p", task]
+               "--model", META_MODEL,
+               "--append-system-prompt", sys_prompt, task]
         try:
             res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
-                                 encoding="utf-8", timeout=1800)
-            ok = res.returncode == 0 and os.path.isfile(os.path.join(out_dir, "full.md"))
+                                 encoding="utf-8", timeout=900)
+            ok = res.returncode == 0 and os.path.isfile(
+                os.path.join(out_dir, "meta.json"))
             if ok:
                 r["status"] = "done"
-                log(f"cleanup: {doc_id} done")
+                log(f"meta: {doc_id} ok")
             else:
-                log(f"cleanup FAILED: {doc_id} rc={res.returncode} "
-                    f"stderr={(res.stderr or '')[-200:]}")
+                log(f"meta FAILED: {doc_id} rc={res.returncode} "
+                    f"{(res.stderr or '')[-200:]}")
         except subprocess.TimeoutExpired:
-            log(f"cleanup TIMEOUT: {doc_id}")
-        except FileNotFoundError:
-            log("cleanup: claude CLI not found — install/login first")
-            return
+            log(f"meta TIMEOUT: {doc_id}")
         save_manifest(m)
 
 
@@ -429,8 +546,9 @@ def main():
         return
 
     stage_extract(m)
+    stage_markdown(m)
     if not args.skip_claude:
-        stage_cleanup(m, limit=args.limit)
+        stage_meta(m, limit=args.limit)
 
     statuses = {}
     for r in m["files"].values():
