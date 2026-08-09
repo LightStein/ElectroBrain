@@ -552,10 +552,23 @@ bot.onText(/\/docs/, async (msg) => {
     return;
   }
   try {
+    // The catalog carries topics and keywords for the router; dumping it raw
+    // is ~28k chars of keyword soup across seven Telegram messages. George
+    // wants to know WHICH documents exist, so send titles only.
     const catalog = fs.readFileSync(CATALOG_PATH, 'utf8');
-    await sendResponse(msg.chat.id, catalog || '(catalog is empty)', msg.message_id);
+    const titles = catalog.split('\n')
+      .filter(l => l.startsWith('- '))
+      .map(l => (l.split('|')[1] || '').trim())
+      .filter(Boolean);
+    if (!titles.length) {
+      await bot.sendMessage(msg.chat.id, 'Список документов пуст — база ещё не построена.');
+      return;
+    }
+    const list = titles.map((t, i) => `${i + 1}. ${t}`).join('\n');
+    await sendResponse(msg.chat.id, `Документов в базе: ${titles.length}\n\n${list}`,
+                       msg.message_id);
   } catch (err) {
-    await bot.sendMessage(msg.chat.id, `Cannot read catalog: ${err.message}`);
+    await bot.sendMessage(msg.chat.id, `Не могу прочитать каталог: ${err.message}`);
   }
 });
 
