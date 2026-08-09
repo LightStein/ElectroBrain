@@ -519,10 +519,15 @@ def rebuild_catalog(m):
         # Topics plus a few keywords from BOTH languages: the router matches
         # the question against this text, so it must contain the words a
         # question would actually use, in either language.
+        # Deliberately short. The whole catalog goes into the router prompt
+        # on every question, and at 56 documents the earlier 8+6+6 shape
+        # projected to ~12.9k tokens of a 16k window - Ollama would have
+        # silently truncated it, dropping documents from the router's view
+        # with no error anywhere. Full keyword lists stay in meta.json.
         terms, seen = [], set()
-        for t in (meta.get("topics") or [])[:8] + \
-                 (meta.get("keywords_ru") or [])[:6] + \
-                 (meta.get("keywords_en") or [])[:6]:
+        for t in (meta.get("topics") or [])[:6] + \
+                 (meta.get("keywords_ru") or [])[:4] + \
+                 (meta.get("keywords_en") or [])[:4]:
             k = str(t).strip().lower()
             if k and k not in seen:
                 seen.add(k)
