@@ -27,6 +27,28 @@ $LogDir  = Join-Path $Root "logs"
 $Node    = (Get-Command node).Source
 $Pipe    = "\\.\pipe\standards-bridge"
 
+# Absolute interpreter path. NSSM services run as LocalSystem, whose PATH does
+# not include a per-user Python install - and on this machine a bare "python"
+# resolves to the Microsoft Store stub, which is not an interpreter at all.
+$Python = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $Python -or $Python -like "*WindowsApps*") {
+    $Python = (Get-ChildItem "$env:LOCALAPPDATA\Programs\Python" -Filter python.exe `
+               -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+}
+if (-not $Python) { Write-Error "Could not find a real python.exe" }
+
+# Claude Code stores its login per user, so a LocalSystem service sees "Not
+# logged in" and /pro escalation dies silently. CLAUDE_CONFIG_DIR points the
+# service at the interactive user's own config directory, which keeps ONE live
+# credential store: copying .credentials.json instead would let the two refresh
+# OAuth tokens independently and invalidate each other. The directory needs a
+# .claude.json inside it (the CLI keeps its own at ~/.claude.json).
+$ClaudeCfg = "$env:USERPROFILE\.claude"
+if ((Test-Path "$env:USERPROFILE\.claude.json") -and
+    -not (Test-Path "$ClaudeCfg\.claude.json")) {
+    Copy-Item "$env:USERPROFILE\.claude.json" "$ClaudeCfg\.claude.json"
+}
+
 # Telegram token/user id come from a git-ignored env file, one KEY=VALUE per line.
 $SecretsFile = Join-Path $Root "secrets.env"
 if (-not (Test-Path $SecretsFile)) {
@@ -59,7 +81,8 @@ function Install-Svc {
 }
 
 # ---- bridge --------------------------------------------------------------
-$askSpawn = '["python","' + ($BotDir -replace '\\', '/') + '/ask.py","-p","{message}"]'
+$askSpawn = '["' + ($Python -replace '\\', '/') + '","' +
+            ($BotDir -replace '\\', '/') + '/ask.py","-p","{message}"]'
 $bridgeEnv = @(
     "BRIDGE_NAME=standards",
     "BRIDGE_SOCKET=$Pipe",
@@ -73,7 +96,8 @@ $bridgeEnv = @(
     "STANDARDS_ROOT=$Root",
     "STANDARDS_RAW=D:\LLM_FILES",
     "OLLAMA_URL=http://127.0.0.1:11434",
-    "ASK_MODEL=qwen3:4b-instruct"
+    "ASK_MODEL=qwen3:4b-instruct",
+    "CLAUDE_CONFIG_DIR=$ClaudeCfg"
 )
 Install-Svc "standards-bridge" $Gateway (Join-Path $Gateway "bridge-server.js") $bridgeEnv
 
