@@ -47,6 +47,28 @@ DOC_EXTS = {".pdf", ".docx", ".doc"}
 TEXT_CHARS_PER_PAGE = 50   # fewer extractable chars than this = image page
 
 
+def find_claude():
+    """Absolute path to a claude CLI that subprocess can actually launch.
+
+    npm installs three shims: `claude` (bash, no extension), `claude.cmd`
+    and `claude.ps1`. Windows can launch only the .cmd, but a bare
+    which("claude") returns the bash shim, which fails with
+    FileNotFoundError and reads as "claude is not installed".
+    """
+    names = ["claude.cmd", "claude.exe", "claude"] if os.name == "nt" else ["claude"]
+    for name in names:
+        p = shutil.which(name)
+        if not p:
+            continue
+        if os.name == "nt" and not p.lower().endswith((".cmd", ".exe", ".bat")):
+            continue
+        return p
+    return None
+
+
+CLAUDE_EXE = find_claude()
+
+
 def log(msg):
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
@@ -248,6 +270,10 @@ def extract_docx(path):
 def stage_cleanup(m, limit=None):
     """claude -p per document: extracted text -> clean full.md + meta.json +
     catalog line. Resumable; a failed doc stays 'extracted' for the next run."""
+    if not CLAUDE_EXE:
+        log("cleanup: claude CLI not found - install it and log in, then "
+            "re-run. Extraction/OCR results are kept, nothing is lost.")
+        return
     with open(CLEANUP_PROMPT, encoding="utf-8") as f:
         sys_prompt = f.read()
     todo = [(n, r) for n, r in m["files"].items() if r["status"] == "extracted"]
@@ -267,7 +293,7 @@ def stage_cleanup(m, limit=None):
                 f"- Write to: {out_dir}\\full.md and {out_dir}\\meta.json\n"
                 f"- Then append/replace this doc's line in {CATALOG}\n")
         log(f"cleanup: {doc_id} ({name}) ...")
-        cmd = ["claude", "--print", "--dangerously-skip-permissions",
+        cmd = [CLAUDE_EXE, "--print", "--dangerously-skip-permissions",
                "--append-system-prompt", sys_prompt, "-p", task]
         try:
             res = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,

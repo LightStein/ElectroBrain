@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -304,6 +305,26 @@ def answer(question, ctx_chunks, history, titles_by_id):
 
 # ----------------------------------------------------------- claude escalate
 
+def find_claude():
+    """Absolute path to a claude CLI that subprocess can actually launch.
+
+    npm installs THREE shims side by side: `claude` (a bash script, with no
+    extension), `claude.cmd` and `claude.ps1`. Windows CreateProcess can run
+    the .cmd, but not the extensionless bash shim and not the .ps1 - and a
+    bare which("claude") finds the bash shim first, which fails with
+    FileNotFoundError and looks exactly like "claude is not installed".
+    """
+    names = ["claude.cmd", "claude.exe", "claude"] if os.name == "nt" else ["claude"]
+    for name in names:
+        p = shutil.which(name)
+        if not p:
+            continue
+        if os.name == "nt" and not p.lower().endswith((".cmd", ".exe", ".bat")):
+            continue  # bash or .ps1 shim - not launchable from subprocess
+        return p
+    return None
+
+
 def escalate_claude(question, history):
     """Strong engine: claude CLI with grep/read over the same index."""
     progress("⚡ Подключаю сильную модель…")
@@ -318,8 +339,11 @@ def escalate_claude(question, history):
     if history:
         hist = "Контекст диалога:\n" + "\n".join(
             f"Q: {h['q'][:300]}\nA: {h['a'][:300]}" for h in history[-2:]) + "\n\n"
+    exe = find_claude()
+    if not exe:
+        return "Сильная модель недоступна: claude CLI не найден."
     cmd = [
-        "claude", "--print", "--dangerously-skip-permissions",
+        exe, "--print", "--dangerously-skip-permissions",
         "--model", CLAUDE_MODEL,
         "--append-system-prompt", sys_prompt,
         "-p", hist + question,
