@@ -31,7 +31,11 @@ from datetime import datetime
 
 ROOT = os.environ.get("STANDARDS_ROOT",
                       os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-RAW = os.path.join(ROOT, "raw")
+# George keeps his documents in his own folder; point at it rather than
+# duplicating them. The pipeline only ever READS here (hash + extract), so
+# aiming it at a live working folder is safe, and deletions there correctly
+# propagate to index removals.
+RAW = os.environ.get("STANDARDS_RAW", os.path.join(ROOT, "raw"))
 WORK = os.path.join(ROOT, "work")
 EXTRACTED = os.path.join(WORK, "extracted")
 OCRED = os.path.join(WORK, "ocred")
@@ -43,7 +47,10 @@ MANIFEST = os.path.join(STATE, "manifest.json")
 REPORT = os.path.join(STATE, "inventory_report.md")
 CLEANUP_PROMPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleanup-prompt.md")
 
-DOC_EXTS = {".pdf", ".docx", ".doc"}
+# .xodt is not a real format - it is an ODT with a typo'd extension, and
+# George's corpus contains one. Identified by magic bytes, handled as odt.
+DOC_EXTS = {".pdf", ".docx", ".doc", ".odt", ".xodt"}
+PANDOC_FMT = {".docx": "docx", ".odt": "odt", ".xodt": "odt"}
 TEXT_CHARS_PER_PAGE = 50   # fewer extractable chars than this = image page
 
 
@@ -183,7 +190,7 @@ def stage_scan(m):
                 log(f"scan: cannot read {name}: {e}")
                 kind, pages, lang = "error", 0, "?"
         else:
-            kind, pages, lang = "docx", None, "?"
+            kind, pages, lang = "office", None, "?"
         m["files"][name] = {
             "sha256": digest, "doc_id": doc_id, "kind": kind,
             "pages": pages, "lang": lang, "status": "scanned",
@@ -226,8 +233,8 @@ def stage_extract(m):
         src = os.path.join(RAW, name)
         out = os.path.join(EXTRACTED, r["doc_id"] + ".txt")
         try:
-            if r["kind"] == "docx":
-                text = extract_docx(src)
+            if r["kind"] == "office":
+                text = extract_doc(src, r["doc_id"])
             elif r["kind"] == "text":
                 text = extract_pdf_text(src)
             else:  # scanned / mixed
@@ -268,14 +275,55 @@ def extract_pdf_ocr(path, doc_id):
     return extract_pdf_text(out_pdf)
 
 
-def extract_docx(path):
+def find_soffice():
+    p = shutil.which("soffice") or shutil.which("soffice.exe")
+    if p:
+        return p
+    for base in (os.environ.get("ProgramFiles", ""),
+                 os.environ.get("ProgramFiles(x86)", "")):
+        if base:
+            cand = os.path.join(base, "LibreOffice", "program", "soffice.exe")
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def soffice_to_docx(path):
+    """Legacy OLE2 .doc -> .docx. Neither pandoc nor python-docx can read the
+    old binary Word format; LibreOffice headless is the reliable converter."""
+    exe = find_soffice()
+    if not exe:
+        raise RuntimeError("legacy .doc needs LibreOffice (winget install "
+                           "TheDocumentFoundation.LibreOffice)")
+    outdir = os.path.join(WORK, "converted")
+    os.makedirs(outdir, exist_ok=True)
+    subprocess.run([exe, "--headless", "--norestore", "--convert-to", "docx",
+                    "--outdir", outdir, path],
+                   capture_output=True, timeout=900)
+    out = os.path.join(outdir,
+                       os.path.splitext(os.path.basename(path))[0] + ".docx")
+    if not os.path.isfile(out):
+        raise RuntimeError("LibreOffice produced no output for this .doc")
+    return out
+
+
+def extract_doc(path, doc_id):
+    """docx/odt via pandoc; legacy .doc via LibreOffice first."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".doc":
+        path = soffice_to_docx(path)
+        ext = ".docx"
     pandoc = shutil.which("pandoc")
-    if pandoc:
-        r = subprocess.run([pandoc, "-t", "gfm", "--wrap=none", path],
-                           capture_output=True, text=True, encoding="utf-8", timeout=600)
+    fmt = PANDOC_FMT.get(ext)
+    if pandoc and fmt:
+        # -f is explicit: pandoc guesses format from the extension, and
+        # .xodt would otherwise be unrecognised.
+        r = subprocess.run([pandoc, "-f", fmt, "-t", "gfm", "--wrap=none", path],
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=600)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout
-    # fallback: python-docx plain paragraphs
+    # fallback: python-docx plain paragraphs (docx only)
     from docx import Document  # pip install python-docx
     d = Document(path)
     return "\n\n".join(p.text for p in d.paragraphs)

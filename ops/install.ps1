@@ -71,6 +71,7 @@ $bridgeEnv = @(
     "BRIDGE_ENGINE_STATE=$Root\state\ask-history.json",
     "BRIDGE_MAX_RUNTIME_MS=900000",
     "STANDARDS_ROOT=$Root",
+    "STANDARDS_RAW=D:\LLM_FILES",
     "OLLAMA_URL=http://127.0.0.1:11434",
     "ASK_MODEL=qwen3:4b-instruct"
 )

@@ -11,6 +11,9 @@ rem is not affected by the codepage.
 chcp 65001 >nul
 cd /d C:\Standards
 set STANDARDS_ROOT=C:\Standards
+rem George keeps his documents here; the pipeline reads them in place
+rem rather than duplicating 60MB into C:\Standards\raw.
+set STANDARDS_RAW=D:\LLM_FILES
 python pipeline\update.py
 echo.
 pause
