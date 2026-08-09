@@ -85,14 +85,25 @@ $SshUser = $env:USERNAME
 Write-Host "Setting up remote access for user: $SshUser"
 
 # --- 1. OpenSSH Server ------------------------------------------
+# Add-WindowsCapability pulls from Windows Update, which stalls for many
+# minutes (or forever) on a machine whose WU is disabled or points at
+# an unreachable WSUS - common after a "debloat" script. So: if an sshd
+# service already exists, accept it and skip the capability entirely.
+# That makes the MSI from the Win32-OpenSSH GitHub release a valid
+# alternative install path. See README, "Add-WindowsCapability hangs".
 Step 1 "OpenSSH Server"
-$cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*" |
-       Select-Object -First 1
-if ($cap.State -ne "Installed") {
-    Add-WindowsCapability -Online -Name $cap.Name | Out-Null
-    Ok "installed $($cap.Name)"
+if (Get-Service sshd -ErrorAction SilentlyContinue) {
+    Ok "sshd already present, skipping Windows Update"
 } else {
-    Ok "already installed"
+    $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*" |
+           Select-Object -First 1
+    if ($cap.State -ne "Installed") {
+        Write-Host "    asking Windows Update (can take 1-15 min)"
+        Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+        Ok "installed $($cap.Name)"
+    } else {
+        Ok "already installed"
+    }
 }
 Set-Service -Name sshd -StartupType Automatic
 Start-Service sshd
