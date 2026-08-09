@@ -96,6 +96,34 @@ if ($TunnelToken -match '\s') {
 if ($TunnelToken.Length -lt 40) {
     Die "Tunnel token looks truncated ($($TunnelToken.Length) chars)."
 }
+# A quote can survive argument parsing and ride on the value, which
+# cloudflared reports only as "illegal base64 data at input byte N" - N
+# being the real token length, so it looks like a truncation when it is
+# actually one character too many. Strip strays, then prove the token is
+# base64 and really is a tunnel token before handing it over.
+$TunnelToken = $TunnelToken.Trim().Trim('"').Trim("'")
+$padded = $TunnelToken
+switch ($TunnelToken.Length % 4) {
+    2 { $padded += "==" }
+    3 { $padded += "=" }
+}
+try {
+    $rawTok = [Convert]::FromBase64String($padded)
+    $tokJson = [Text.Encoding]::UTF8.GetString($rawTok)
+} catch {
+    Die ("Token is not valid base64 ($($TunnelToken.Length) chars). " +
+         "Re-copy it from the Cloudflare dashboard.")
+}
+if ($tokJson -notmatch '"t"\s*:\s*"([0-9a-f-]{36})"') {
+    Die "Token decoded but carries no tunnel id - wrong string copied?"
+}
+# A token clipped at the end still decodes and still shows a tunnel id,
+# so check the JSON actually closes.
+if ($tokJson -notmatch '\}\s*$') {
+    Die "Token is truncated - the decoded payload does not close."
+}
+Write-Host ("    token ok: $($TunnelToken.Length) chars, " +
+            "tunnel $($matches[1])")
 if ($PublicKey -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]{68} \S+$') {
     Die "Public key is malformed - this file was altered."
 }
