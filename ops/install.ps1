@@ -62,6 +62,26 @@ Get-Content $SecretsFile | Where-Object { $_ -match "=" -and $_ -notmatch "^\s*#
 
 New-Item -ItemType Directory -Force -Path $RunDir, (Join-Path $RunDir "pending"), $LogDir, (Join-Path $BotDir "uploads") | Out-Null
 
+# Generate registry.json from secrets.env so there is ONE file to fill in.
+# Hand-editing a chat id into JSON in a second place is exactly the kind of
+# step that gets forgotten, and the failure mode is silent: the bot starts
+# fine and ignores every message from the unlisted chat.
+$ChatId = $Secrets['TELEGRAM_CHAT_ID']
+if ($ChatId) {
+    $registry = @{
+        projects = @(@{
+            name   = "standards"
+            chatId = [int64]$ChatId
+            socket = $Pipe
+            upload = (Join-Path $BotDir "uploads")
+        })
+    } | ConvertTo-Json -Depth 5
+    Set-Content (Join-Path $Gateway "registry.json") -Value $registry -Encoding utf8
+    Write-Host "registry.json written for chat $ChatId"
+} else {
+    Write-Host "WARNING: no TELEGRAM_CHAT_ID in secrets.env - registry.json left as-is"
+}
+
 function Install-Svc {
     param($Name, $AppDir, $Script, $EnvVars)
     & nssm stop $Name 2>$null
