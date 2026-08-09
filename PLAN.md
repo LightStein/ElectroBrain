@@ -120,7 +120,25 @@ Ollama 0.32.6 (pre-existing, plus `qwen2.5:7b`/`nomic-embed-text` from earlier e
 (the silent installer ships English only; `best` beats `fast` noticeably on scanned Cyrillic).
 Repo cloned to `C:\Standards`.
 
-Still to install: Claude Code CLI (+ login as `eveli`).
+Claude Code CLI 2.1.226 installed and logged in as `eveli`; headless `claude -p` verified.
+
+**`/pro` escalation measured: 16.1s** - correct answer, correct citation, and *faster than
+the local model* (26-29s), because Haiku generates quickly and does its own grep over the
+index. Two Windows-specific bugs had to be fixed to get there, both of which would have
+broken the preprocessing pipeline identically on its first real run:
+
+1. npm installs `claude` (a bash script, no extension), `claude.cmd` and `claude.ps1`
+   alongside the real `bin/claude.exe`. A bare `which("claude")` returns the bash shim,
+   which Windows cannot execute - reported as "claude CLI not found", indistinguishable
+   from it not being installed.
+2. The `.cmd` shim re-parses arguments through `cmd.exe`, which mangles the multi-line
+   `--append-system-prompt` into nothing; claude then exits with "Input must be provided...".
+   Fixed by launching `bin/claude.exe` directly, so argv survives with no shell involved.
+
+Worth revisiting once the real corpus is indexed: if `/pro` stays both faster and more
+accurate, the sensible default may be Claude-first with the local model as the offline
+fallback, rather than the other way round. That is a cost/latency tradeoff for Anri to
+call - local is free and offline, Claude costs plan usage per question.
 
 ## Remaining phases
 
