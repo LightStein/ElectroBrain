@@ -11,7 +11,7 @@
 #
 #   [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 #   $u = 'https://raw.githubusercontent.com/LightStein/ElectroBrain' +
-#        '/main/ops/laptop-setup/setup-access.ps1.example'
+#        '/main/ops/laptop-setup/setup-access.ps1'
 #   Invoke-WebRequest $u -OutFile C:\setup-access.ps1 -UseBasicParsing
 #   powershell -ExecutionPolicy Bypass -File C:\setup-access.ps1 `
 #              -TunnelToken "<paste token from Cloudflare dashboard>"
@@ -57,6 +57,25 @@ function Warn($t) { Write-Host "    [!!] $t" -ForegroundColor Yellow }
 function Die($t)  {
     Write-Host "`nFATAL: $t" -ForegroundColor Red
     exit 1
+}
+
+# Run an external .exe safely.
+#
+# With $ErrorActionPreference = 'Stop', ANY line a native tool writes to
+# stderr becomes a TERMINATING error once stderr is redirected - even a
+# success message. cloudflared logs "INF Installing cloudflared Windows
+# service" to stderr while installing correctly, and that killed this
+# script mid-install. Exit code is the only trustworthy signal, so drop
+# to 'Continue' for the call and judge by $LASTEXITCODE.
+function Invoke-Native {
+    param([string]$Exe, [string[]]$ArgList)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    $out = & $Exe @ArgList 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    return [pscustomobject]@{ Output = $out; Code = $code }
 }
 
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -115,13 +134,35 @@ Ok "sshd running, starts at boot"
 Step 2 "SSH default shell"
 $pwsh = "C:\Program Files\PowerShell\7\pwsh.exe"
 if (-not (Test-Path $pwsh)) {
-    try {
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
         Write-Host "    installing PowerShell 7 via winget"
-        winget install --id Microsoft.PowerShell --silent `
-            --accept-package-agreements --accept-source-agreements `
-            --disable-interactivity | Out-Null
+        $wa = @("install","--id","Microsoft.PowerShell","--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements")
+        Invoke-Native "winget" $wa | Out-Null
+    }
+}
+if (-not (Test-Path $pwsh)) {
+    # winget is missing or broken on plenty of machines. Take the MSI
+    # straight from the PowerShell repo, exactly as we did for OpenSSH.
+    try {
+        Write-Host "    winget path failed, fetching the MSI"
+        [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+        $api = "https://api.github.com/repos/PowerShell" +
+               "/PowerShell/releases/latest"
+        $rel = Invoke-RestMethod $api -UseBasicParsing
+        $asset = $rel.assets |
+                 Where-Object { $_.name -like "*-win-x64.msi" } |
+                 Select-Object -First 1
+        if ($asset) {
+            $msi = "$env:TEMP\pwsh7.msi"
+            Invoke-WebRequest $asset.browser_download_url `
+                -OutFile $msi -UseBasicParsing
+            $r = Invoke-Native "msiexec.exe" @("/i", $msi, "/qn")
+            Start-Sleep -Seconds 3
+        }
     } catch {
-        Warn "winget install failed: $($_.Exception.Message)"
+        Warn "MSI install failed: $($_.Exception.Message)"
     }
 }
 if (Test-Path $pwsh) {
@@ -187,8 +228,8 @@ $adminKeys = "$env:ProgramData\ssh\administrators_authorized_keys"
 $n = Set-AuthorizedKey $adminKeys
 # ACL must be Administrators+SYSTEM only or sshd ignores the file.
 # SIDs, not names: this laptop runs a non-English Windows.
-icacls.exe $adminKeys /inheritance:r /grant "*S-1-5-32-544:F" `
-    /grant "*S-1-5-18:F" | Out-Null
+Invoke-Native "icacls.exe" @($adminKeys, "/inheritance:r",
+    "/grant", "*S-1-5-32-544:F", "/grant", "*S-1-5-18:F") | Out-Null
 Ok "admin file: $adminKeys ($n key(s), ACL locked)"
 Restart-Service sshd
 
@@ -211,10 +252,15 @@ if (-not (Test-Path $cfExe)) {
 # A pre-existing service may be bound to a stale or broken token.
 if (Get-Service cloudflared -ErrorAction SilentlyContinue) {
     Warn "removing existing cloudflared service"
-    & $cfExe service uninstall 2>&1 | Out-Null
+    Invoke-Native $cfExe @("service","uninstall") | Out-Null
     Start-Sleep -Seconds 2
 }
-& $cfExe service install $TunnelToken 2>&1 | Out-Null
+# cloudflared logs progress to stderr on success - see Invoke-Native.
+$r = Invoke-Native $cfExe @("service","install",$TunnelToken)
+if ($r.Code -ne 0) {
+    Warn "cloudflared install exit $($r.Code):"
+    Write-Host $r.Output
+}
 Start-Sleep -Seconds 3
 Set-Service -Name cloudflared -StartupType Automatic
 Start-Service cloudflared -ErrorAction SilentlyContinue
@@ -229,14 +275,18 @@ if ($cf -and $cf.Status -eq "Running") {
 # A sleeping laptop kills the tunnel. On AC only; battery behaviour
 # is left alone.
 Step 5 "Power settings (AC only)"
-powercfg /change standby-timeout-ac 0
-powercfg /change hibernate-timeout-ac 0
-powercfg /change monitor-timeout-ac 20
+foreach ($pc in @(
+        @("/change","standby-timeout-ac","0"),
+        @("/change","hibernate-timeout-ac","0"),
+        @("/change","monitor-timeout-ac","20"))) {
+    Invoke-Native "powercfg" $pc | Out-Null
+}
 # SUB_BUTTONS / lid-close-action, 0 = do nothing
 $subButtons = "4f971e89-eebd-4455-a8de-9e59040e7347"
 $lidAction = "5ca83367-6e45-459f-a27b-476b1d01c936"
-powercfg /setacvalueindex SCHEME_CURRENT $subButtons $lidAction 0
-powercfg /setactive SCHEME_CURRENT
+Invoke-Native "powercfg" @("/setacvalueindex","SCHEME_CURRENT",
+    $subButtons, $lidAction, "0") | Out-Null
+Invoke-Native "powercfg" @("/setactive","SCHEME_CURRENT") | Out-Null
 Ok "plugged in: never sleeps, lid close ignored"
 
 # --- 6. Firewall ------------------------------------------------
@@ -261,9 +311,9 @@ Write-Host "    cpu      : $cpu"
 Write-Host "    ram      : $ram GB"
 Write-Host "    C: free  : $([math]::Round($disk/1GB,1)) GB"
 try {
-    $q = "name,memory.total,driver_version"
-    $gpu = & nvidia-smi --query-gpu=$q --format=csv,noheader
-    Write-Host "    gpu      : $gpu"
+    $q = "--query-gpu=name,memory.total,driver_version"
+    $r = Invoke-Native "nvidia-smi" @($q, "--format=csv,noheader")
+    Write-Host "    gpu      : $($r.Output.Trim())"
 } catch {
     $g = (Get-CimInstance Win32_VideoController |
           Where-Object { $_.Name -match "NVIDIA" }).Name
