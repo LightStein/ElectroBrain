@@ -66,6 +66,14 @@ MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "6000"))
 # mean more documents represented for the same number of tokens.
 CHUNK_CHARS = int(os.environ.get("ASK_CHUNK_CHARS", "1200"))
 MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "2"))
+# The question's own words matter far more than keywords expanded from
+# meta.json; weighting them equally is what let reference lists outrank real
+# clauses.
+QUESTION_TERM_WEIGHT = 3.0
+EXPANDED_TERM_WEIGHT = 1.0
+# A chunk that is mostly "ГОСТ Р 55842-2013 (ИСО 30061:2007) ..." is a
+# normative-references list. It matches many terms and answers nothing.
+REFLIST_RE = re.compile(r"(ГОСТ|МЭК|ИСО|IEC|ISO|СП|СНиП|EN)\s*[Р\s]*[\d.\-]{3,}", re.I)
 # Off by default: the default model has no thinking mode to enable.
 THINK_FINAL = os.environ.get("ASK_THINK_FINAL", "0") == "1"
 AUTO_ESCALATE = os.environ.get("ASK_AUTO_ESCALATE", "0") == "1"
@@ -206,9 +214,17 @@ def load_meta_index():
 
 
 def route_lexical(question, metas, max_docs=12):
-    """Pick candidate documents and build bilingual search terms, no model."""
+    """Pick candidate documents and build WEIGHTED bilingual search terms.
+
+    The question's own words are the real signal; expanded keywords only
+    broaden reach. Weighting them equally let reference-list sections win -
+    they are dense with standard names, so they collect keyword hits without
+    containing any answer.
+    """
     qt = question_tokens(question)
-    scored, terms = [], set(re.findall(r"[\wа-яёА-ЯЁ]{4,}", question.lower()))
+    scored = []
+    terms = {w: QUESTION_TERM_WEIGHT
+             for w in re.findall(r"[\wа-яёА-ЯЁ]{4,}", question.lower())}
 
     for doc_id, meta in metas.items():
         ru = meta.get("keywords_ru") or []
@@ -246,11 +262,13 @@ def route_lexical(question, metas, max_docs=12):
     scored.sort(key=lambda x: -x[0])
     top = scored[:max_docs]
     for _, _, hits in top:
-        terms.update(h for h in hits if len(h) > 2)
+        for h in hits:
+            if len(h) > 2:
+                terms.setdefault(h, EXPANDED_TERM_WEIGHT)
     doc_ids = [d for _, d, _ in top]
     # No keyword hit anywhere: fall back to scanning everything rather than
     # answering "not found" from an empty shortlist.
-    return sorted(terms), doc_ids
+    return terms, doc_ids
 
 # ------------------------------------------- stage A (legacy): LLM routing
 
@@ -360,6 +378,7 @@ def split_chunks(text, max_chars=CHUNK_CHARS):
 
 
 def term_regexes(terms):
+    """`terms` may be a dict {term: weight} or a plain iterable."""
     """One regex per WORD, not per term.
 
     Keywords from meta.json are often phrases ("Выключатели и коммутационная
@@ -368,8 +387,9 @@ def term_regexes(terms):
     into words recovers that signal; the words are what appear in the
     documents.
     """
+    weights = terms if isinstance(terms, dict) else {t: 1.0 for t in terms}
     out, seen = [], set()
-    for term in terms:
+    for term, tw in weights.items():
         for w in re.findall(r"[\wа-яёА-ЯЁ]+", str(term)):
             if len(w) < 4:
                 continue
@@ -380,7 +400,7 @@ def term_regexes(terms):
             if key in seen:
                 continue
             seen.add(key)
-            out.append((w, re.compile(re.escape(stem), re.I)))
+            out.append((w, re.compile(re.escape(stem), re.I), tw))
     return out
 
 
@@ -402,7 +422,7 @@ def retrieve(doc_ids, terms):
 
     # idf-lite: a term hitting every doc tells us little
     per_doc_chunks = {}
-    doc_freq = {t: 0 for t, _ in regs}
+    doc_freq = {t: 0 for t, _, _ in regs}
     for did, p in doc_paths(ids):
         try:
             with open(p, encoding="utf-8") as f:
@@ -410,7 +430,7 @@ def retrieve(doc_ids, terms):
         except OSError:
             continue
         per_doc_chunks[did] = split_chunks(text)
-        for t, rx in regs:
+        for t, rx, _ in regs:
             if rx.search(text):
                 doc_freq[t] += 1
 
@@ -421,11 +441,17 @@ def retrieve(doc_ids, terms):
     for did, chunks in per_doc_chunks.items():
         for ch in chunks:
             s = 0.0
-            for t, rx in regs:
+            for t, rx, tw in regs:
                 hits = len(rx.findall(ch))
                 if hits:
-                    s += weights[t] * min(hits, 4)
+                    s += weights[t] * tw * min(hits, 4)
             if s > 0:
+                # Normative-reference lists are keyword-dense and answer
+                # nothing; discount them rather than dropping them outright,
+                # since a reference can occasionally be the answer.
+                refs = len(REFLIST_RE.findall(ch))
+                if refs >= 3 and refs * 60 > len(ch):
+                    s *= 0.25
                 scored.append((s, did, ch))
     scored.sort(key=lambda x: -x[0])
 
