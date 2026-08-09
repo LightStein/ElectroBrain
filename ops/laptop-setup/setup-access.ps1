@@ -117,13 +117,17 @@ try {
 if ($tokJson -notmatch '"t"\s*:\s*"([0-9a-f-]{36})"') {
     Die "Token decoded but carries no tunnel id - wrong string copied?"
 }
+# Capture NOW. Every later -match/-notmatch overwrites $matches, and the
+# truncation check below has no capture group, so reading $matches[1]
+# after it yields an empty string.
+$tunnelId = $matches[1]
 # A token clipped at the end still decodes and still shows a tunnel id,
 # so check the JSON actually closes.
 if ($tokJson -notmatch '\}\s*$') {
     Die "Token is truncated - the decoded payload does not close."
 }
 Write-Host ("    token ok: $($TunnelToken.Length) chars, " +
-            "tunnel $($matches[1])")
+            "tunnel $tunnelId")
 if ($PublicKey -notmatch '^ssh-ed25519 [A-Za-z0-9+/=]{68} \S+$') {
     Die "Public key is malformed - this file was altered."
 }
@@ -152,8 +156,15 @@ if (Get-Service sshd -ErrorAction SilentlyContinue) {
         Ok "already installed"
     }
 }
-Set-Service -Name sshd -StartupType Automatic
-Start-Service sshd
+try {
+    Set-Service -Name sshd -StartupType Automatic
+    Start-Service sshd
+} catch {
+    # "marked for deletion" means DeleteService ran while something
+    # still held a handle on it. Only a restart clears that state.
+    Die ("cannot configure sshd: $($_.Exception.Message)`n" +
+         "  If it says marked for deletion: REBOOT, then re-run.")
+}
 Ok "sshd running, starts at boot"
 
 # --- 2. PowerShell 7 as the SSH shell ---------------------------
