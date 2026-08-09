@@ -140,43 +140,61 @@ accurate, the sensible default may be Claude-first with the local model as the o
 fallback, rather than the other way round. That is a cost/latency tradeoff for Anri to
 call - local is free and offline, Claude costs plan usage per question.
 
-## Remaining phases
+## Current state (2026-08-09, live on the laptop)
 
-### Phase 0 — Access (Anri, ~30 min)
-OpenSSH Server + cloudflared tunnel on the laptop; Anri verifies login.
-First commands: `nvidia-smi`, disk space, Windows version, power settings (lid ≠ sleep).
+**Done and verified end-to-end:**
+- Access: OpenSSH + cloudflared, both boot services. User is `eveli`, not `george`.
+- Toolchain: Python 3.12 (+pymupdf, python-docx, ocrmypdf), Node 24, git, NSSM,
+  pandoc, LibreOffice, Tesseract 5 with tessdata_best rus+eng.
+- Ollama 0.32.6 with `qwen3:4b-instruct`; Claude Code 2.1.226 logged in as `eveli`.
+- Corpus indexed from `D:\LLM_FILES` (56 files, 3047 pages, 16.3M chars, zero
+  scanned - every PDF already had a text layer, so no OCR pass was needed).
+- Bridge over a Windows named pipe: `/health`, `/prompt` ndjson stream, durable
+  pending file written before `done`. `gateway/smoke-test.js` re-checks this.
+- Local engine 26-29s per answer; `/pro` Claude escalation 16.1s.
+- Deleting a document removes its index entry, extracted text and catalog line.
 
-### Phase 1 — Environment (remote, ~1-2h)
-Ollama for Windows + `qwen3:4b` (bench `qwen3:8b` once for the record); Python 3.12 +
-`pip install pymupdf python-docx`; pandoc; OCRmyPDF + Tesseract (rus+eng traineddata);
-Node.js LTS; NSSM (winget); Claude Code CLI + login (Anri's account); git-copy this repo
-to C:\Standards; `npm install` in gateway\.
-Benchmark: 5 Russian standards questions → confirm think=ON timing fits ~30s.
+**Bugs found by testing, all of which would have presented to George as
+"the bot doesn't answer" with nothing useful in any log:**
 
-### Phase 2 — Inventory (remote, ~30 min + Anri review)
-`python pipeline\update.py --scan-only` → review `state\inventory_report.md`
-(text/scanned/mixed counts, page volume, weird files) before burning OCR/Claude time.
+1. `shell:true` on the engine spawn - split the question across argv AND made
+   an unescaped Telegram message a command-injection vector.
+2. npm's `claude` shims: the extensionless bash one is unlaunchable, and the
+   `.cmd` one re-parses arguments through cmd.exe, destroying the multi-line
+   system prompt. Fixed by calling `bin/claude.exe` directly.
+3. NSSM services run as LocalSystem: Claude's per-user login was invisible, so
+   `/pro` would have failed. Fixed with `CLAUDE_CONFIG_DIR` pointing at the
+   real store - not a copy, since OAuth refresh rotates tokens and two copies
+   would invalidate each other.
+4. Ollama was only a per-user Startup entry, so after an unattended reboot the
+   bridge would have come up with no engine behind it. Now a boot service, with
+   `OLLAMA_MODELS` carried explicitly (models are on D: via a USER variable a
+   service cannot see) and bound to loopback.
+5. The router prompt embeds the whole catalog: at 56 documents the original
+   shape projected to ~12.9k tokens of a 16k window, so Ollama would have
+   silently truncated it and made documents unroutable.
 
-### Phase 3 — Extraction + OCR + cleanup (remote, unattended, resumable)
-`python pipeline\update.py --limit 10` first → QA those 10 by hand (scanned RU, scanned EN,
-digital, table-heavy) → tune cleanup-prompt.md if needed → run the rest (may span days if
-Claude plan limits pause it; manifest makes re-runs free). Re-OCR the "quality: poor" list.
+## Remaining
 
-### Phase 4 — Gateway live (remote, ~2h)
-Create bot via BotFather (privacy mode OFF for group use), fill secrets.env; George's group
-→ /chatid → registry.json; `ops\install.ps1`; test battery of ~20 real questions from George
-(colors, heights, distances, sections; follow-ups; /pro; a photo → escalation path).
+1. **Telegram bot** - blocked on a NEW token. The one supplied was the
+   production `laamarie_web_dev_bot` with a typo; two pollers on one token
+   break each other, which would take down all 16 of Anri's live chats.
+   Then: `ops\install.ps1` (reads `secrets.env`, writes `registry.json`,
+   registers all three services).
+2. **Answer-quality pass** on the full corpus once indexing finishes - the
+   first real measure of whether this is useful to George.
+3. **Optional:** `0-fed_zakon_№ 185.pdf` is education law, not electrical.
+   Anri to decide whether it stays.
 
-### Phase 5 — Handover (remote, ~1h)
-Autostart sanity (services boot without login? NSSM = yes, it's a service), Ollama autostart,
-one-page Russian cheat-sheet for George (raw\ folder, Update-Standards.bat, /docs /pro /clear),
-Obsidian pointed at index\ (optional).
+## Open questions worth revisiting after real use
 
-## Risks / open items
-- **4GB VRAM + think=ON latency** — measured only on CPU so far; on-site benchmark decides.
-  Escape hatches: think=off + prompt retune, or `/pro`-style claude as default engine (zero
-  architecture change either way).
-- OCR quality on worst scans → QA sample + per-doc visual fallback (individually affordable).
-- Preprocessing volume vs Claude plan limits → resumable loop, spans days if needed.
-- Laptop uptime: bot lives only while the laptop is on (services run pre-login though).
-- node-telegram-bot-api long-poll wedges (seiv lessons) → all three watchdog layers ported.
+- **Claude-first vs local-first.** `/pro` is both faster (16s vs 26-29s) and
+  more accurate than the local model on this hardware. If that holds on real
+  questions, the sensible default may invert - local becomes the offline
+  fallback. It is a cost decision (local is free, Claude spends plan usage),
+  not a technical one.
+- **Dropping the routing LLM call.** It costs ~13.5s of the budget. Since
+  `meta.json` now carries ALIGNED RU/EN keyword pairs, the question could be
+  matched lexically against them instead, removing an LLM round trip and the
+  query-translation problem in one go. Worth doing only if latency matters
+  more than routing quality on the real corpus.
