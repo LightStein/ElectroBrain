@@ -58,6 +58,11 @@ CLEANUP_PROMPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clean
 # Opening slice handed to Claude for metadata. Standards state their title,
 # scope and contents up front, so this is plenty and keeps the pass cheap.
 SAMPLE_CHARS = int(os.environ.get("STANDARDS_SAMPLE_CHARS", "14000"))
+# Catalog line budget. The whole catalog is embedded in the router prompt on
+# every single question, so its size is a latency and correctness constraint,
+# not cosmetics.
+TITLE_CAP = int(os.environ.get("STANDARDS_TITLE_CAP", "110"))
+LINE_CAP = int(os.environ.get("STANDARDS_LINE_CAP", "380"))
 META_MODEL = os.environ.get("STANDARDS_META_MODEL", "haiku")
 
 # .xodt is not a real format - it is an ODT with a typo'd extension, and
@@ -532,11 +537,22 @@ def rebuild_catalog(m):
             if k and k not in seen:
                 seen.add(k)
                 terms.append(str(t).strip())
-        title = meta.get("title") or doc_id
+        # Hard per-line cap. Measured on the real corpus, untrimmed lines
+        # averaged 841 chars -> 47k chars (~15.7k tokens) for 56 documents,
+        # which does not fit a 16k window alongside the prompt and response.
+        # Full titles and keyword lists remain in meta.json; this line only
+        # has to be good enough for the router to shortlist candidates.
+        title = (meta.get("title") or doc_id).strip()
+        if len(title) > TITLE_CAP:
+            title = title[:TITLE_CAP].rsplit(" ", 1)[0] + "..."
         lang = meta.get("lang") or "?"
-        flag = "  [OCR-качество: низкое]" if meta.get("quality") == "poor" else ""
-        lines.append(f"- {meta.get('id', doc_id)} | {title} | {lang} | "
-                     f"{', '.join(terms)}{flag}")
+        flag = "  [OCR: низкое]" if meta.get("quality") == "poor" else ""
+        head = f"- {meta.get('id', doc_id)} | {title} | {lang} | "
+        room = max(0, LINE_CAP - len(head) - len(flag))
+        joined = ", ".join(terms)
+        if len(joined) > room:
+            joined = joined[:room].rsplit(",", 1)[0]
+        lines.append(head + joined + flag)
         n += 1
     with open(CATALOG, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
