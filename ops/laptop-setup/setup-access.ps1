@@ -162,25 +162,55 @@ function Register-Sshd {
     }
 }
 
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    Register-Sshd
+# Microsoft's own MSI. Preferred over the Windows capability because it
+# needs no Windows Update, which is broken or absent on plenty of
+# machines. A stale install record can survive while the files are gone,
+# and /i is a no-op in that state, so uninstall first.
+function Install-OpenSshMsi {
+    try {
+        Write-Host "    fetching the OpenSSH MSI from GitHub"
+        [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+        $api = "https://api.github.com/repos/PowerShell" +
+               "/Win32-OpenSSH/releases"
+        $rel = (Invoke-RestMethod $api -UseBasicParsing)[0]
+        $a = $rel.assets |
+             Where-Object { $_.name -like "OpenSSH-Win64-*.msi" } |
+             Select-Object -First 1
+        if (-not $a) { Warn "no MSI in the latest release"; return }
+        $msi = "$env:TEMP\openssh.msi"
+        Invoke-WebRequest $a.browser_download_url -OutFile $msi `
+            -UseBasicParsing
+        Invoke-Native "msiexec.exe" @("/x", $msi, "/qn") | Out-Null
+        Start-Sleep -Seconds 2
+        $ia = @("/i", $msi, "ADDLOCAL=Server", "/qn")
+        Invoke-Native "msiexec.exe" $ia | Out-Null
+        Start-Sleep -Seconds 3
+    } catch {
+        Warn "MSI install failed: $($_.Exception.Message)"
+    }
 }
-if (Get-Service sshd -ErrorAction SilentlyContinue) {
-    Ok "sshd present, skipping Windows Update"
-} else {
+
+function Have-Sshd {
+    return [bool](Get-Service sshd -ErrorAction SilentlyContinue)
+}
+
+if (-not (Have-Sshd)) { Register-Sshd }
+if (-not (Have-Sshd)) { Install-OpenSshMsi; Register-Sshd }
+if (-not (Have-Sshd)) {
+    # Last resort: Windows Update. Slow, and it is exactly the path that
+    # fails on a machine with WU disabled, so it goes last.
     $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*" |
            Select-Object -First 1
-    if ($cap.State -ne "Installed") {
+    if ($cap -and $cap.State -ne "Installed") {
         Write-Host "    asking Windows Update (can take 1-15 min)"
         Add-WindowsCapability -Online -Name $cap.Name | Out-Null
     }
     Register-Sshd
 }
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    Die ("no sshd service and none could be registered. Install the" +
-         " MSI from the Win32-OpenSSH GitHub release, then re-run:`n" +
-         "  msiexec /i C:\openssh.msi ADDLOCAL=Server /qn")
+if (-not (Have-Sshd)) {
+    Die "no sshd service, and every install path failed."
 }
+Ok "sshd present"
 try {
     Set-Service -Name sshd -StartupType Automatic
     Start-Service sshd
