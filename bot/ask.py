@@ -463,7 +463,9 @@ def retrieve(doc_ids, terms):
         if per_doc.get(did, 0) >= MAX_CHUNKS_PER_DOC:
             continue
         if used + len(ch) > MAX_CHUNK_CHARS and out:
-            break
+            # skip this one, not the rest: a single oversized chunk used to
+            # end selection early and drop smaller ones that still fitted
+            continue
         out.append((did, ch))
         per_doc[did] = per_doc.get(did, 0) + 1
         used += len(ch)
