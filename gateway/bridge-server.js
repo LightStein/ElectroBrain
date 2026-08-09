@@ -145,6 +145,10 @@ function doCompact() {
       '--print',
       '--dangerously-skip-permissions',
       '-p', '/compact',
+      // shell is safe here and nowhere else in this file: every argument is a
+      // fixed literal, none of it comes from a user message, and on Windows a
+      // shell is what resolves the `claude` .cmd shim. Only reachable in
+      // stream-json (claude) mode; plain-engine mode disables compaction.
     ], { cwd: WORK_DIR, env: makeEnv(), stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' });
 
     let out = '';
@@ -270,9 +274,14 @@ function runSpawn(body, res) {
       cwd: WORK_DIR,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      // On Windows, `claude` is claude.cmd — resolving .cmd shims needs a shell.
-      // Everything user-controlled is in the args ARRAY, never concatenated.
-      shell: process.platform === 'win32',
+      // NO shell. With shell:true node concatenates argv into one command
+      // string and cmd.exe re-splits it on whitespace, so a question like
+      // "какого цвета провод" arrived at the engine as four arguments. Worse,
+      // that string is Telegram-supplied and unescaped (node's DEP0190), so a
+      // message containing & or | would have been a command-injection vector.
+      // Without a shell the array goes straight to CreateProcess intact.
+      // BRIDGE_SPAWN must therefore name a real executable (python.exe,
+      // node.exe), never a .cmd/.bat shim.
     });
 
     currentProcess = child;

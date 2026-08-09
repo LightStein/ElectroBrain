@@ -54,7 +54,14 @@ const req = http.request(
       }
     });
     res.on('end', () => {
-      const ok = seen.includes('started') && seen.includes('done') && finalText;
+      // A `done` event carrying an error string is still a failure. The first
+      // run of this test reported PASS while the engine was actually printing
+      // "ask.py: error: unrecognized arguments" - the bridge had split the
+      // question across argv. Check the payload, not just the event sequence.
+      const looksBroken = /usage:|error:|Traceback|Ошибка|не найден/i.test(finalText);
+      const ok = seen.includes('started') && seen.includes('done') &&
+                 finalText && !looksBroken;
+      if (looksBroken) console.error('\nFAIL: engine returned an error, not an answer');
       console.log(`\nevents      : ${seen.join(' -> ')}`);
       console.log(`pending file: ${pendingSeenBeforeDone ? 'written before done (correct)' : 'MISSING'}`);
       console.log(`answer      :\n${finalText}`);
