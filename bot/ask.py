@@ -153,9 +153,12 @@ ROUTE_SYSTEM = """Ты — маршрутизатор вопросов к кат
 
 
 # Router prompt budget in CHARACTERS. num_ctx counts prompt AND response, so
-# the catalog cannot have the window to itself. Roughly 3 chars/token for
-# mixed Russian, leaving room for the system prompt, history and the answer.
-CATALOG_BUDGET = int(os.environ.get("ASK_CATALOG_BUDGET", str(NUM_CTX * 2)))
+# reserve room for the system prompt, history, question and the JSON reply,
+# then convert with a deliberately pessimistic 2.5 chars/token - Russian
+# tokenises worse than English, and over-estimating here only costs some
+# keyword detail, while under-estimating silently truncates the prompt.
+CATALOG_BUDGET = int(os.environ.get("ASK_CATALOG_BUDGET",
+                                    str(int((NUM_CTX - 1500) * 2.5))))
 
 
 def shrink_catalog(catalog_text):
