@@ -168,7 +168,13 @@ $bridgeEnv = @(
     "STANDARDS_RAW=D:\LLM_FILES",
     "OLLAMA_URL=http://127.0.0.1:11434",
     "ASK_MODEL=qwen3:4b-instruct",
-    "CLAUDE_CONFIG_DIR=$ClaudeCfg"
+    "CLAUDE_CONFIG_DIR=$ClaudeCfg",
+    # Without these Python writes stdout in the Windows ANSI codepage while
+    # node decodes the pipe as UTF-8, so every Russian answer reached Telegram
+    # as "?????". It never showed up in testing because the manual test
+    # commands all set PYTHONIOENCODING by hand - the service did not.
+    "PYTHONIOENCODING=utf-8",
+    "PYTHONUTF8=1"
 )
 Install-Svc "standards-bridge" $Gateway (Join-Path $Gateway "bridge-server.js") $bridgeEnv
 
