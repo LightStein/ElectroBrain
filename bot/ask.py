@@ -59,6 +59,13 @@ HISTORY_FILE = os.environ.get("ASK_HISTORY_FILE", os.path.join(ROOT, "state", "a
 # ~5000 tokens = ~44s of prompt processing before generation even begins.
 # 6000 keeps the answer call inside a usable chat latency.
 MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "6000"))
+# Per-chunk size. At 2500 the 6000-char budget fit only TWO chunks, so a
+# single document could take both slots and crowd out the one that actually
+# held the answer - observed with a switch-height question where СП 256 was
+# correctly shortlisted but never made it into the context. Smaller chunks
+# mean more documents represented for the same number of tokens.
+CHUNK_CHARS = int(os.environ.get("ASK_CHUNK_CHARS", "1200"))
+MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "2"))
 # Off by default: the default model has no thinking mode to enable.
 THINK_FINAL = os.environ.get("ASK_THINK_FINAL", "0") == "1"
 AUTO_ESCALATE = os.environ.get("ASK_AUTO_ESCALATE", "0") == "1"
@@ -326,7 +333,7 @@ def route(question, catalog_text, history):
 HEADING_RE = re.compile(r"^#{1,4}\s", re.M)
 
 
-def split_chunks(text, max_chars=2500):
+def split_chunks(text, max_chars=CHUNK_CHARS):
     """Split a Markdown doc into heading-delimited chunks; oversized chunks are
     split again on blank lines."""
     positions = [m.start() for m in HEADING_RE.finditer(text)] or [0]
@@ -410,11 +417,17 @@ def retrieve(doc_ids, terms):
                 scored.append((s, did, ch))
     scored.sort(key=lambda x: -x[0])
 
-    out, used = [], 0
+    # Cap per document. Without this the highest-scoring document can take
+    # every slot, which is exactly how a correctly-shortlisted document ended
+    # up contributing nothing to the answer.
+    out, used, per_doc = [], 0, {}
     for s, did, ch in scored:
+        if per_doc.get(did, 0) >= MAX_CHUNKS_PER_DOC:
+            continue
         if used + len(ch) > MAX_CHUNK_CHARS and out:
             break
         out.append((did, ch))
+        per_doc[did] = per_doc.get(did, 0) + 1
         used += len(ch)
         if len(out) >= 8:
             break
