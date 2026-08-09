@@ -65,6 +65,7 @@ so the corpus stays browsable by hand.
 
 ## Secrets
 
-Nothing sensitive is tracked. `ops/laptop-setup/setup-access.ps1` (Cloudflare
-tunnel token) and `secrets.env` (Telegram bot token) are gitignored — copy
-`setup-access.ps1.example` and fill it in locally.
+Nothing sensitive is tracked. `secrets.env` (Telegram bot token) is gitignored.
+The Cloudflare tunnel token is passed to `setup-access.ps1` as a command-line
+argument rather than stored in the file, so the script itself carries no secret
+and can be downloaded straight from this repo.

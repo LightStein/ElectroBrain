@@ -40,13 +40,30 @@ Do this **logged in as George's own Windows account** — the assistant's servic
 and the Claude Code CLI login have to live under the same user, so whichever
 account you use here is the account everything runs as.
 
-1. Right-click Start → **Terminal (Administrator)**
-2. `notepad C:\setup-access.ps1` → paste `setup-access.ps1` → save → close
-3. Edit one line at the top: `$TunnelToken = "<the token you copied>"`
-4. Run it:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File C:\setup-access.ps1
-   ```
+**Do not copy-paste the script.** Download it, so the bytes arrive exactly as
+written. A terminal that soft-wraps at 73 columns turns those wraps into real
+newlines when copied, which silently split the tunnel token and the SSH key
+mid-string on the first attempt — the script reported success and
+authentication could never have worked.
+
+Right-click Start → **Terminal (Administrator)**, then:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+$u = 'https://raw.githubusercontent.com/LightStein/ElectroBrain' +
+     '/main/ops/laptop-setup/setup-access.ps1'
+Invoke-WebRequest $u -OutFile C:\setup-access.ps1 -UseBasicParsing
+
+powershell -ExecutionPolicy Bypass -File C:\setup-access.ps1 -TunnelToken "PASTE_TOKEN"
+```
+
+Copy the token straight from the Cloudflare dashboard into that last command —
+a browser copy is not wrapped, and the console handles a long pasted line fine.
+The script refuses to run if the token contains whitespace or looks truncated,
+so a mangled paste now fails loudly instead of silently.
+
+`Tls12` is required because PowerShell 5.1 still defaults to TLS 1.0/1.1 in
+some configurations, which GitHub rejects.
 
 The script installs OpenSSH Server, sets PowerShell 7 as the SSH shell, installs
 Claude's public key, installs cloudflared as a boot-start Windows service bound
@@ -68,7 +85,7 @@ Then check the tunnel shows **HEALTHY** in the Cloudflare dashboard.
 ```
 Host ssh-george
     HostName ssh-george.deltaops.net
-    User george                       # updated once the script reports the real username
+    User eveli
     IdentityFile ~/.ssh/george_laptop
     ProxyCommand /home/anri/cloudflared access ssh --hostname %h
     StrictHostKeyChecking no
@@ -77,8 +94,9 @@ Host ssh-george
     TCPKeepAlive yes
 ```
 
-Keypair: `~/.ssh/george_laptop` (private, stays here) / `.pub` (already baked into
-the script).
+Keypair: `~/.ssh/george_laptop` (private, stays here) / `.pub` (baked into the
+script, split across short string fragments so no line exceeds 72 columns;
+`ops/check-encoding.sh` verifies it still reassembles to the real key).
 
 Smoke test once the tunnel is up:
 ```bash

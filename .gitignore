@@ -1,8 +1,4 @@
 # ── secrets ──────────────────────────────────────────────────────────────────
-# The filled-in setup script carries a live Cloudflare tunnel token (a
-# credential — anyone holding it can run a connector for the tunnel). Only the
-# .example template is tracked; copy it and fill the token locally.
-ops/laptop-setup/setup-access.ps1
 secrets.env
 *.pem
 *.key
@@ -24,3 +20,8 @@ node_modules/
 package-lock.json
 __pycache__/
 *.pyc
+
+# editor scratch (can contain secrets from an in-progress edit)
+*.swp
+*.swo
+*~
