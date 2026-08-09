@@ -91,11 +91,19 @@ AUTO_ESCALATE = os.environ.get("ASK_AUTO_ESCALATE", "0") == "1"
 # "lexical" (default) routes without a model - see stage A. "llm" keeps the
 # original catalog-in-prompt router, retained for comparison.
 ROUTER = os.environ.get("ASK_ROUTER", "lexical")
-# Precision is worth more than speed here (Anri, explicitly), so the
-# synonym pass is on by default despite costing a model call.
-EXPAND_QUERY = os.environ.get("ASK_EXPAND", "1") == "1"
+# Measured three ways on the same nine questions:
+#   6k context, no expansion : 3 cited, 6 not-found, 0 uncited, median 22s
+#   14k + expansion          : 2 cited, 6 not-found, 1 uncited, median 82s
+#   6k + expansion           : 3 cited, 5 not-found, 1 uncited, median 48s
+# Expansion buys no extra citations, doubles latency, and produced an
+# UNCITED answer - the one failure a revisor cannot absorb. Off by default;
+# ASK_EXPAND=1 to re-test if the corpus or model changes.
+EXPAND_QUERY = os.environ.get("ASK_EXPAND", "0") == "1"
 CLAUDE_MODEL = os.environ.get("ASK_CLAUDE_MODEL", "haiku")
 PRO_PROMPT_FILE = os.environ.get("ASK_PRO_PROMPT", os.path.join(SCRIPT_DIR, "pro-prompt.md"))
+
+# A source line: the 📄 marker, or an explicit clause reference.
+CITATION_RE = re.compile(r"📄|\bп\.\s*\d|\bпункт\s*\d", re.I)
 
 CATALOG = os.path.join(ROOT, "index", "catalog.md")
 DOCS_DIR = os.path.join(ROOT, "index", "docs")
@@ -771,6 +779,16 @@ def main():
 
     reply = answer(question, chunks, history, titles)
     log(f"answer {time.time()-t0:.1f}s")
+
+    # Enforce the citation contract in CODE, not just in the prompt. An
+    # answer without a source is the dangerous failure here: it reads as
+    # authoritative and gives a revisor nothing to verify against. Observed
+    # twice in testing, so the prompt alone is not sufficient.
+    if "NOT_FOUND" not in reply and not CITATION_RE.search(reply):
+        log("answer had no citation - refusing to present it as sourced")
+        reply = ("Нашёл похожий текст, но не смог указать точный пункт "
+                 "документа — не показываю такой ответ.\n"
+                 "Спроси сильную модель: /pro " + question[:150])
 
     if "NOT_FOUND" in reply:
         if AUTO_ESCALATE:
