@@ -473,8 +473,7 @@ def stage_meta(m, limit=None):
                 f"- Language guess: {r.get('lang')}\n"
                 f"- Full text (already built, do NOT rewrite it): {md_path}\n"
                 f"- A sample of its opening is at: {sample_file}\n"
-                f"- Write ONLY: {out_dir}\\meta.json\n"
-                f"- Then append/replace this doc's line in {CATALOG}\n")
+                f"- Write ONLY: {out_dir}\\meta.json\n")
         cmd = [CLAUDE_EXE, "--print", "--dangerously-skip-permissions",
                "--model", META_MODEL,
                "--append-system-prompt", sys_prompt, task]
@@ -492,6 +491,51 @@ def stage_meta(m, limit=None):
         except subprocess.TimeoutExpired:
             log(f"meta TIMEOUT: {doc_id}")
         save_manifest(m)
+
+
+def rebuild_catalog(m):
+    """Regenerate catalog.md from every meta.json.
+
+    Claude used to append its own line here, and a run silently produced
+    meta.json without the catalog line - leaving a document the router could
+    never deliberately select. Deriving the catalog from the meta files makes
+    that class of drift impossible, and makes the catalog self-healing: fix a
+    meta.json, re-run, done.
+    """
+    lines = ["# Каталог стандартов", "",
+             "<!-- построено автоматически из index/docs/*/meta.json -->",
+             "<!-- строки: - <id> | <название> | <ru/en> | <темы> -->", ""]
+    n = 0
+    for doc_id in sorted(os.listdir(DOCS) if os.path.isdir(DOCS) else []):
+        mp = os.path.join(DOCS, doc_id, "meta.json")
+        if not os.path.isfile(mp):
+            continue
+        try:
+            with open(mp, encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            log(f"catalog: unreadable meta.json for {doc_id}")
+            continue
+        # Topics plus a few keywords from BOTH languages: the router matches
+        # the question against this text, so it must contain the words a
+        # question would actually use, in either language.
+        terms, seen = [], set()
+        for t in (meta.get("topics") or [])[:8] + \
+                 (meta.get("keywords_ru") or [])[:6] + \
+                 (meta.get("keywords_en") or [])[:6]:
+            k = str(t).strip().lower()
+            if k and k not in seen:
+                seen.add(k)
+                terms.append(str(t).strip())
+        title = meta.get("title") or doc_id
+        lang = meta.get("lang") or "?"
+        flag = "  [OCR-качество: низкое]" if meta.get("quality") == "poor" else ""
+        lines.append(f"- {meta.get('id', doc_id)} | {title} | {lang} | "
+                     f"{', '.join(terms)}{flag}")
+        n += 1
+    with open(CATALOG, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    log(f"catalog: rebuilt with {n} document(s)")
 
 
 def remove_from_index(doc_id):
@@ -549,6 +593,7 @@ def main():
     stage_markdown(m)
     if not args.skip_claude:
         stage_meta(m, limit=args.limit)
+    rebuild_catalog(m)
 
     statuses = {}
     for r in m["files"].values():

@@ -43,15 +43,11 @@ Produce exactly two things.
 If the opening sample is too garbled to identify the document, still write the
 file, set `"quality": "poor"`, and say so in your final message.
 
-## 2. One line appended to the catalog
+## Do not touch the catalog
 
-Format (if a line with this id already exists, replace it):
-
-```
-- <id> | <title> | <lang> | <5-10 main topics, comma separated, Russian and English>
-```
-
-The catalog is what the router reads to choose candidate documents, so the
-topics there should be the words a question would actually contain.
+`catalog.md` is generated automatically from all the `meta.json` files, so
+write yours and stop there. (It used to be appended by hand here, and a run
+that wrote `meta.json` but skipped the append left a document the router
+could never select.)
 
 Final message: one line — doc id, title, ok or poor.
