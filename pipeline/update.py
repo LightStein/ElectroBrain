@@ -351,41 +351,80 @@ def extract_doc(path, doc_id):
 # ---------------------------------------------- stage: mechanical markdown
 
 PAGE_RE = re.compile(r"\[\[page (\d+)\]\]")
-# "1.1.29 Title", "5.2. Title", "10.12 Title" - the clause numbering a revisor
-# actually cites. Promoting these to headings is what makes retrieval work at
-# all: ask.py splits documents on Markdown headings, so without them a
-# 3.4M-char file is one undifferentiated blob.
-CLAUSE_RE = re.compile(r"^(\d+(?:\.\d+){0,3})[.)]?\s+(\S.{0,120})$")
-SECTION_RE = re.compile(r"^(Приложение|ПРИЛОЖЕНИЕ|Раздел|РАЗДЕЛ|Annex|Section)\b.{0,80}$")
-HYPHEN_RE = re.compile(r"(\w)[-­]\n(\w)")
+
+# A clause number needs at least one dot: "1.1.29", "10.12". Requiring it is
+# what stops a wrapped line beginning "220 кВ; 5,3 м — для ВЛ" from becoming a
+# heading. Bare enumerators like "5)" are deliberately NOT clauses - promoting
+# them detached the rule from the clause number that makes it citable, and in
+# one federal law 97% of "headings" were enumerator items.
+# No end anchor and no length cap: the previous ".{0,120}$" silently refused
+# to promote 1,498 real clauses across the corpus purely for being long
+# sentences - 83% of ПТЭЭП, the document an inspector consults most.
+CLAUSE_RE = re.compile(r"^(\d+(?:\.\d+){1,3})[.)]?\s+(\S)")
+# A unit or another number right after the "clause number" means it is a
+# measurement continuing a sentence, not a clause: "220 кВ", "50 мкОм".
+UNIT_AFTER_RE = re.compile(r"^\s*(кВ|кв|кА|В|А|мА|мкОм|Ом|м|мм|см|мм2|°С|Гц|%|\d)",
+                           re.I)
+SECTION_RE = re.compile(
+    r"^(Приложение|ПРИЛОЖЕНИЕ|Раздел|РАЗДЕЛ|Глава|ГЛАВА|Статья|СТАТЬЯ"
+    r"|Annex|Section|Chapter|Article)\b.{0,80}$")
+HYPHEN_RE = re.compile(r"(\w)[-\u00ad]\n(\w)")
+HEAD_MAX = 110
 
 
 def page_furniture(pages):
     """Lines repeated across many pages: watermarks, running heads, footers.
 
-    One document here carries "Электротехническая библиотека Elec.ru" twice on
-    every page. Left in, it pollutes retrieval and wastes context on every
-    chunk that quotes it.
+    One document carries "Электротехническая библиотека Elec.ru" twice on
+    every page. Left in, it pollutes retrieval and wastes context.
     """
     seen = {}
     for pg in pages:
         for line in {l.strip() for l in pg.split("\n") if l.strip()}:
             if len(line) < 90:
                 seen[line] = seen.get(line, 0) + 1
-    threshold = max(3, int(len(pages) * 0.3))
+    threshold = max(4, int(len(pages) * 0.3))
     return {l for l, n in seen.items() if n >= threshold}
+
+
+def strip_page_number(body):
+    """Remove a bare page number from the edges of ONE page.
+
+    This replaces a blanket `line.isdigit()` filter that deleted 17,054 lines
+    - 7.4% of the whole corpus. In a standards corpus a line that is just
+    "30" is an ampacity, an IP rating or a table cell far more often than it
+    is a folio; one cable-sizing ГОСТ lost 26% of its lines that way, taking
+    the exact numbers an inspector asks for with it. Page numbers are a
+    POSITIONAL phenomenon, so only the first/last couple of lines of a page
+    are eligible, and only short integers.
+    """
+    ls = body.split("\n")
+    if len(ls) <= 4:
+        return body
+    for i in (0, 1, -1, -2):
+        t = ls[i].strip()
+        if t.isdigit() and len(t) <= 4:
+            ls[i] = ""
+    return "\n".join(ls)
+
+
+def clause_key(num):
+    try:
+        return tuple(int(x) for x in num.split("."))
+    except ValueError:
+        return None
 
 
 def to_markdown(text, title):
     pages = PAGE_RE.split(text)
-    # split() yields [pre, num, body, num, body, ...] - keep the bodies
     bodies = pages[2::2] if len(pages) > 1 else pages
+    bodies = [strip_page_number(b) for b in bodies]
     junk = page_furniture(bodies) if len(bodies) > 2 else set()
 
     text = "\n".join(bodies)
-    text = HYPHEN_RE.sub(r"\1\2", text)          # join hyphenated line breaks
+    text = HYPHEN_RE.sub(r"\1\2", text)
 
-    out, blank = [f"# {title}", ""], False
+    out, blank, last = [f"# {title}", ""], False, None
     for raw in text.split("\n"):
         line = raw.rstrip()
         stripped = line.strip()
@@ -394,15 +433,34 @@ def to_markdown(text, title):
                 out.append("")
             blank = True
             continue
-        if stripped in junk or stripped.isdigit():
-            continue                              # watermark / bare page number
+        if stripped in junk:
+            continue
         blank = False
+
         if SECTION_RE.match(stripped):
             out.append(f"\n## {stripped}\n")
-        elif CLAUSE_RE.match(stripped):
-            out.append(f"\n### {stripped}\n")
-        else:
-            out.append(line)
+            last = None          # numbering restarts in a new section/annex
+            continue
+
+        m = CLAUSE_RE.match(stripped)
+        if m:
+            num = m.group(1)
+            rest = stripped[m.end(1):].lstrip(".) ")
+            key = clause_key(num)
+            # Clause numbers ascend. A "220" mid-sentence does not continue
+            # the sequence; that is exactly how "### 220 кВ; 5,3 м" happened.
+            ascending = key is not None and (
+                last is None or key > last or key[0] > last[0])
+            if ascending and not UNIT_AFTER_RE.match(rest):
+                last = key
+                if len(stripped) <= HEAD_MAX:
+                    out.append(f"\n### {stripped}\n")
+                else:
+                    head = stripped[:HEAD_MAX].rsplit(" ", 1)[0]
+                    out.append(f"\n### {head}...\n")
+                    out.append(line)      # full text kept, nothing truncated
+                continue
+        out.append(line)
     md = "\n".join(out)
     return re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
 
