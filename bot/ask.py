@@ -360,15 +360,27 @@ def split_chunks(text, max_chars=CHUNK_CHARS):
 
 
 def term_regexes(terms):
-    out = []
-    for t in terms:
-        t = t.strip()
-        if len(t) < 2:
-            continue
-        # Substring match on word prefix — tolerant of Russian inflections
-        # ("заземлен" matches "заземления/заземлённый").
-        stem = t[:max(4, len(t) - 2)] if re.search(r"[а-яА-Я]", t) and len(t) > 5 else t
-        out.append((t, re.compile(re.escape(stem), re.I)))
+    """One regex per WORD, not per term.
+
+    Keywords from meta.json are often phrases ("Выключатели и коммутационная
+    аппаратура"). Escaped whole they match nothing at all - verified: every
+    multi-word term missed on text that plainly contained its words. Splitting
+    into words recovers that signal; the words are what appear in the
+    documents.
+    """
+    out, seen = [], set()
+    for term in terms:
+        for w in re.findall(r"[\wа-яёА-ЯЁ]+", str(term)):
+            if len(w) < 4:
+                continue
+            # Prefix match, tolerant of Russian inflection: "заземлен" also
+            # catches "заземления" / "заземлённый".
+            stem = w[:max(4, len(w) - 2)] if re.search(r"[а-яёА-ЯЁ]", w) and len(w) > 5 else w
+            key = stem.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((w, re.compile(re.escape(stem), re.I)))
     return out
 
 
