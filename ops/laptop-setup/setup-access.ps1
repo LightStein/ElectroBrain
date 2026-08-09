@@ -143,18 +143,43 @@ Write-Host "Setting up remote access for user: $SshUser"
 # That makes the MSI from the Win32-OpenSSH GitHub release a valid
 # alternative install path. See README, "Add-WindowsCapability hangs".
 Step 1 "OpenSSH Server"
+
+# Binaries and the SERVICE are separate things. A deleted service, or
+# an interrupted capability install, leaves sshd.exe on disk while DISM
+# still reports the capability as Installed - so "already installed" and
+# "no such service" are both true at once. install-sshd.ps1 ships with
+# both the capability and the MSI and registers the service offline.
+function Register-Sshd {
+    $paths = @(
+        "$env:SystemRoot\System32\OpenSSH\install-sshd.ps1",
+        "$env:ProgramFiles\OpenSSH\install-sshd.ps1")
+    $p = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($p) {
+        Write-Host "    registering the service via install-sshd.ps1"
+        try { & $p | Out-Null } catch {
+            Warn "install-sshd.ps1 failed: $($_.Exception.Message)"
+        }
+    }
+}
+
+if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+    Register-Sshd
+}
 if (Get-Service sshd -ErrorAction SilentlyContinue) {
-    Ok "sshd already present, skipping Windows Update"
+    Ok "sshd present, skipping Windows Update"
 } else {
     $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*" |
            Select-Object -First 1
     if ($cap.State -ne "Installed") {
         Write-Host "    asking Windows Update (can take 1-15 min)"
         Add-WindowsCapability -Online -Name $cap.Name | Out-Null
-        Ok "installed $($cap.Name)"
-    } else {
-        Ok "already installed"
     }
+    Register-Sshd
+}
+if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+    Die ("no sshd service and none could be registered. Install the" +
+         " MSI from the Win32-OpenSSH GitHub release, then re-run:`n" +
+         "  msiexec /i C:\openssh.msi ADDLOCAL=Server /qn")
 }
 try {
     Set-Service -Name sshd -StartupType Automatic
