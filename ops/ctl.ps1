@@ -1,4 +1,4 @@
-# ctl.ps1 — docker-compose-style control for the standards gateway.
+# ctl.ps1 - docker-compose-style control for the standards gateway.
 #
 #   ctl.ps1 status                    services + bridge /health + ollama
 #   ctl.ps1 start|stop|restart [svc]  svc = bot | bridge | all (default all)
@@ -64,7 +64,7 @@ switch ($Cmd) {
         Write-Host "waiting for bridge to go idle..."
         while ($true) {
             $h = Bridge-Health
-            if (-not $h) { Write-Host "bridge unreachable — restarting anyway"; break }
+            if (-not $h) { Write-Host "bridge unreachable - restarting anyway"; break }
             if (-not $h.busy -and $h.queueDepth -eq 0) { break }
             Write-Host ("  busy={0} queue={1}; rechecking in 15s" -f $h.busy, $h.queueDepth)
             Start-Sleep -Seconds 15

@@ -315,6 +315,14 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     args = ap.parse_args()
 
+    # User-facing text lives here rather than in Update-Standards.bat: cmd.exe
+    # renders Cyrillic in a .bat as mojibake under any codepage, while Python 3
+    # writes Unicode straight to the Windows console API.
+    print("=" * 50)
+    print(" Обновление базы стандартов…")
+    print(" Это может занять несколько минут — не закрывай окно.")
+    print("=" * 50)
+
     os.makedirs(INDEX, exist_ok=True)
     os.makedirs(DOCS, exist_ok=True)
     if not os.path.isfile(CATALOG):
@@ -338,6 +346,16 @@ def main():
     for r in m["files"].values():
         statuses[r["status"]] = statuses.get(r["status"], 0) + 1
     log("summary: " + ", ".join(f"{k}: {v}" for k, v in sorted(statuses.items())))
+
+    done = statuses.get("done", 0)
+    failed = sum(v for k, v in statuses.items() if "fail" in k)
+    print()
+    print("=" * 50)
+    print(f" Готово. Документов в базе: {done}")
+    if failed:
+        print(f" Не удалось обработать: {failed} — покажи это Анри.")
+    print(f" Отчёт: {REPORT}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":

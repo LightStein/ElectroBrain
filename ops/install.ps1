@@ -1,4 +1,11 @@
-# install.ps1 — register the standards gateway as Windows services via NSSM.
+# install.ps1 - register the standards gateway as Windows services via NSSM.
+#
+# Keep this file PURE ASCII. Windows PowerShell 5.1 decodes .ps1 with the system
+# ANSI codepage (CP1251 here) unless there is a UTF-8 BOM, and byte 0x94 - which
+# appears inside the UTF-8 bytes of an em-dash and of box-drawing characters -
+# becomes a smart quote that PowerShell treats as a string delimiter. Russian
+# user-facing strings belong in bot.js / ask.py, which Node and Python read as
+# UTF-8 unconditionally.
 # Run as Administrator, once, after files are in place under C:\Standards.
 #
 # Prereqs (Phase 1 of PLAN.md): node in PATH, python in PATH, nssm in PATH
@@ -76,8 +83,10 @@ $botEnv = @(
     "REGISTRY_PATH=$Gateway\registry.json",
     "RUN_DIR=$RunDir",
     "UPLOADS_DIR=$BotDir\uploads",
-    "CATALOG_PATH=$Root\index\catalog.md",
-    "STATUS_TEXT=Ищу в стандартах…"
+    "CATALOG_PATH=$Root\index\catalog.md"
+    # STATUS_TEXT is intentionally NOT set here: its Russian default lives in
+    # bot.js, which Node reads as UTF-8. Setting it from an ASCII-only .ps1
+    # would force mojibake or reintroduce the codepage trap described above.
 )
 Install-Svc "standards-bot" $Gateway (Join-Path $Gateway "bot.js") $botEnv
 

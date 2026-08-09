@@ -95,6 +95,7 @@ ssh ssh-george "whoami; nvidia-smi --query-gpu=name,memory.total --format=csv,no
 | `Permission denied (publickey)` | Wrong SSH username — use the `user` line the script printed, not "george" if the profile is named differently. |
 | Key ignored for an admin account | `administrators_authorized_keys` ACL. The script sets it via SIDs; verify with `icacls C:\ProgramData\ssh\administrators_authorized_keys` (only Administrators + SYSTEM). |
 | `Add-WindowsCapability` fails | Windows Update component broken. Fallback: install OpenSSH from https://github.com/PowerShell/Win32-OpenSSH/releases |
+| `Отсутствует закрывающий знак "}"` / `MissingEndCurlyBrace` at paste time | The script picked up a non-ASCII character. PowerShell 5.1 decodes `.ps1` with the ANSI codepage (CP1251) unless there's a UTF-8 BOM, which Win11 Notepad doesn't write; byte `0x94` — inside the UTF-8 bytes of `—` and `─` — then becomes a smart quote that PowerShell treats as a string delimiter. The script is pure ASCII to avoid this; re-copy it unmodified. `ops/check-encoding.sh` enforces it. |
 | Connects but commands quote badly | `DefaultShell` didn't take. Check `Get-ItemProperty HKLM:\SOFTWARE\OpenSSH`, then `Restart-Service sshd`. |
 | Need LAN SSH back | `Enable-NetFirewallRule -Name "OpenSSH-Server-In-TCP"` |
 | `scp` fails | Windows OpenSSH + PowerShell shell breaks legacy scp. Use `sftp` (or git) instead. |
