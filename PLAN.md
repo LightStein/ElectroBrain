@@ -4,12 +4,15 @@
 cited answers from his ~160 PDF/DOCX standards documents (electrical wiring, fire systems,
 grounding, lightning protection, …) in ≤30s, running on his own laptop.
 
-**Hardware:** ASUS gaming laptop — Intel CPU, NVIDIA 4GB VRAM (RTX 3050 laptop), 16GB DDR4-2400, Windows.
+**Hardware (measured on-site, 2026-08-09):** ASUS laptop, Windows 11 Pro 26200, user `eveli`.
+Intel i5-9300H (4c/8t), 15.9GB RAM, 135GB free. **GPU: NVIDIA GTX 1650, 4GB VRAM, driver
+555.97, compute 7.5** — a Turing card with no tensor cores, weaker than the 3050/3060
+originally assumed, which makes the 4B model choice mandatory rather than merely preferred.
 
-**Status: gateway ported and integration-tested on Anri's host. Waiting on SSH access to the laptop.**
+**Status: SSH access live; Phase 1 complete; engine benchmarked on the real machine.**
 
 ## Final decisions
-- Daily engine: **local `qwen3:4b`** via Ollama; **`claude -p` (haiku)** escalation via `/pro`
+- Daily engine: **local `qwen3:4b-instruct`** via Ollama (see benchmark below); **`claude -p` (haiku)** escalation via `/pro`
   command, image/file messages, or (optional) auto-escalation on NOT_FOUND.
 - Preprocessing: free tools (pymupdf, OCRmyPDF/Tesseract rus+eng, pandoc) extract text;
   **Claude Code CLI** (Anri's account) does text-in/text-out cleanup into the index.
@@ -32,9 +35,9 @@ gateway/bot.js             port of seiv bot: registry routing, durable pending s
 gateway/pending.js         unchanged logic, env-configurable dir
 gateway/healthcheck.js     /health over named pipe (curl can't) — used by ctl.ps1
 gateway/registry.json      one project "standards"; chatId filled in after /chatid
-bot/ask.py                 the engine: route (qwen, think=off, JSON) -> lexical retrieve
+bot/ask.py                 the engine: route (qwen, JSON) -> lexical retrieve
                            (heading chunks, tf*idf-lite, RU stem-prefix matching) -> answer
-                           (qwen, think=ON, mandatory citations) -> NOT_FOUND handling ->
+                           (qwen, mandatory citations) -> NOT_FOUND handling ->
                            claude escalation (PRO:/images/auto). Stdlib-only. History file.
 bot/pro-prompt.md          system prompt for the claude escalation (grep/read the index, cite)
 pipeline/update.py         scan (hash+classify text/scanned/mixed) -> extract (pymupdf/pandoc)
@@ -55,13 +58,11 @@ ops/ctl.ps1                compose-like control incl. drained restart (port of b
   - route: correct doc + good bilingual search terms
   - retrieve: exact clause chunk found
   - answer: correct, cited («квота» + п. + document), Russian, with verification footer
-- **Findings:** (1) final answer needs think=ON — with think=off qwen3:4b wrongly said
-  NOT_FOUND on an answerable question; ASK_THINK_FINAL=1 is the default. (2) router can
-  hallucinate doc ids → now validated against the catalog, unknown ids ⇒ full-corpus scan.
-- CPU timings here (no GPU): route ~40-60s, answer(think) ~1.5-10min. On the 4GB GPU with the
-  model fully resident expect ~5-15s route + ~10-30s answer. **Benchmark on-site**; if thinking
-  is too slow there, the lever is ASK_THINK_FINAL=0 + retuning the answer prompt (must re-test:
-  think=off currently degrades accuracy).
+- **Finding that survived:** the router can hallucinate doc ids → now validated against the
+  catalog, unknown ids ⇒ full-corpus scan.
+- The CPU-only timings measured here were superseded by the on-laptop benchmark below, as was
+  the "answer needs think=ON" finding — that was an artefact of `qwen3:4b`, and the switch to
+  `qwen3:4b-instruct` removes thinking from the picture entirely.
 
 ## Answer contract (non-negotiable)
 Every answer cites document title + clause number + verbatim quote and ends with
@@ -84,7 +85,44 @@ C:\Standards\
 └── Update-Standards.bat
 ```
 
-## Remaining phases (need SSH — ~2 days out)
+## Measured on the target laptop (2026-08-09)
+
+| What | Result |
+|---|---|
+| `qwen3:4b` generation | 13.7-14.9 tok/s |
+| `qwen3:4b` prompt processing | ~150 tok/s |
+| **`qwen3:4b-instruct`** generation | **17.9 tok/s** |
+| One-line question, `qwen3:4b` | 49s (454-663 tokens, ~all thinking) |
+| One-line question, `qwen3:4b-instruct` | **7.3s (30 tokens)** |
+| Full `ask.py` pipeline, 2-doc index | **26.5-29.1s** (route ~13.5s + answer ~15s) |
+
+**Decision: `qwen3:4b-instruct` is the daily model.** `qwen3:4b` thinks unconditionally —
+neither Ollama's `think: false` nor Qwen's `/no_think` suppresses it — and spends 400-600
+tokens reasoning about a one-line question, which at 14 tok/s is ~30-45s of pure overhead.
+The `-instruct` variant has no thinking mode at all and answered the same question correctly
+in 7.3s. `ASK_THINK_FINAL` now defaults to 0.
+
+Both test questions returned correct answers with the required document + clause + verbatim
+quote. End-to-end is at the 30s target, but with little headroom.
+
+**Known optimisation if it proves too slow on the real 160-doc corpus:** the routing LLM call
+(~13.5s, half the budget) can be replaced with pure lexical matching of the question against
+the RU/EN keyword lists in each `meta.json`. That would need the cleanup agent to emit
+*aligned* RU/EN keyword pairs, giving a project-specific translation table and removing the
+need for an LLM to do query translation at all. Not built yet - retrieval quality on the real
+corpus should decide it.
+
+## Phase 1 complete - installed on the laptop
+
+Ollama 0.32.6 (pre-existing, plus `qwen2.5:7b`/`nomic-embed-text` from earlier experiments),
+`qwen3:4b` + `qwen3:4b-instruct` pulled, Python 3.12.10 (+ pymupdf, python-docx, ocrmypdf
+17.10), Node 24.19, git 2.55, NSSM, pandoc, Tesseract 5 with **tessdata_best** `rus`+`eng`
+(the silent installer ships English only; `best` beats `fast` noticeably on scanned Cyrillic).
+Repo cloned to `C:\Standards`.
+
+Still to install: Claude Code CLI (+ login as `eveli`).
+
+## Remaining phases
 
 ### Phase 0 — Access (Anri, ~30 min)
 OpenSSH Server + cloudflared tunnel on the laptop; Anri verifies login.

@@ -72,7 +72,7 @@ $bridgeEnv = @(
     "BRIDGE_MAX_RUNTIME_MS=900000",
     "STANDARDS_ROOT=$Root",
     "OLLAMA_URL=http://127.0.0.1:11434",
-    "ASK_MODEL=qwen3:4b"
+    "ASK_MODEL=qwen3:4b-instruct"
 )
 Install-Svc "standards-bridge" $Gateway (Join-Path $Gateway "bridge-server.js") $bridgeEnv
 

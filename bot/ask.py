@@ -24,11 +24,12 @@ Escalation to `claude -p` (strong engine, Anri's account):
 Configuration via environment (all optional):
   STANDARDS_ROOT     root folder (default: parent of this script's directory)
   OLLAMA_URL         default http://127.0.0.1:11434
-  ASK_MODEL          default qwen3:4b
+  ASK_MODEL          default qwen3:4b-instruct (non-thinking)
   ASK_NUM_CTX        default 16384
   ASK_HISTORY_FILE   default <root>/state/ask-history.json
   ASK_MAX_CHUNK_CHARS  total retrieval budget, default 12000
-  ASK_THINK_FINAL    "1" (default) = let qwen think on the final answer
+  ASK_THINK_FINAL    "1" = let the model think (default 0; the default
+                     model has no thinking mode)
   ASK_AUTO_ESCALATE  "1" = auto-run claude when qwen finds nothing (default 0)
   ASK_CLAUDE_MODEL   default "haiku"
   ASK_PRO_PROMPT     default <script dir>/pro-prompt.md
@@ -46,11 +47,16 @@ import urllib.request
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("STANDARDS_ROOT", os.path.dirname(SCRIPT_DIR))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-MODEL = os.environ.get("ASK_MODEL", "qwen3:4b")
+# qwen3:4b thinks unconditionally in Ollama - neither think=false nor
+# /no_think suppresses it - and burns ~450 tokens (~30s on a GTX 1650)
+# on a one-line question. The -instruct variant does not think at all:
+# same question, 30 tokens, 7s. Measured on the target laptop.
+MODEL = os.environ.get("ASK_MODEL", "qwen3:4b-instruct")
 NUM_CTX = int(os.environ.get("ASK_NUM_CTX", "16384"))
 HISTORY_FILE = os.environ.get("ASK_HISTORY_FILE", os.path.join(ROOT, "state", "ask-history.json"))
 MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "12000"))
-THINK_FINAL = os.environ.get("ASK_THINK_FINAL", "1") == "1"
+# Off by default: the default model has no thinking mode to enable.
+THINK_FINAL = os.environ.get("ASK_THINK_FINAL", "0") == "1"
 AUTO_ESCALATE = os.environ.get("ASK_AUTO_ESCALATE", "0") == "1"
 CLAUDE_MODEL = os.environ.get("ASK_CLAUDE_MODEL", "haiku")
 PRO_PROMPT_FILE = os.environ.get("ASK_PRO_PROMPT", os.path.join(SCRIPT_DIR, "pro-prompt.md"))
