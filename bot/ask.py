@@ -37,6 +37,7 @@ Configuration via environment (all optional):
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -71,6 +72,10 @@ MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "2"))
 # clauses.
 QUESTION_TERM_WEIGHT = 3.0
 EXPANDED_TERM_WEIGHT = 1.0
+# An acronym or standard designation in the question is close to a filter:
+# if the user says TN-C or IP44, chunks containing it are almost certainly
+# the right ones.
+DESIGNATION_WEIGHT = 8.0
 # A chunk that is mostly "ГОСТ Р 55842-2013 (ИСО 30061:2007) ..." is a
 # normative-references list. It matches many terms and answers nothing.
 REFLIST_RE = re.compile(r"(ГОСТ|МЭК|ИСО|IEC|ISO|СП|СНиП|EN)\s*[Р\s]*[\d.\-]{3,}", re.I)
@@ -193,9 +198,30 @@ def norm_token(w):
     return w
 
 
+# Keeps designations whole: TN-C, TN-C-S, IP44, ГОСТ, 50571.5.52, УЗО.
+# The previous pattern split on the hyphen and then dropped both halves for
+# being under 4 characters, so "чем отличается TN-C от TN-S" reached
+# retrieval carrying only the word "система" - which matches every document
+# in an electrical corpus. The most discriminating tokens were the ones
+# being thrown away.
+TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+(?:[-.][A-Za-zА-Яа-яЁё0-9]+)*")
+# All-caps Latin/Cyrillic, or anything with a digit or hyphen: acronyms and
+# standard designations. Rare, and therefore worth far more than prose words.
+DESIGNATION_RE = re.compile(r"^(?:[A-ZА-ЯЁ]{2,}(?:[-.][A-ZА-ЯЁ0-9]+)*|.*[\d].*|.*-.*)$")
+
+
+def is_designation(w):
+    return bool(DESIGNATION_RE.match(w)) and len(w) >= 2
+
+
 def question_tokens(question):
-    raw = re.findall(r"[\wа-яёА-ЯЁ]{3,}", question.lower())
-    return {norm_token(w) for w in raw if w not in STOPWORDS}
+    out = set()
+    for w in TOKEN_RE.findall(question):
+        if is_designation(w):
+            out.add(w.lower())
+        elif len(w) >= 3 and w.lower() not in STOPWORDS:
+            out.add(norm_token(w))
+    return out
 
 
 def load_meta_index():
@@ -223,8 +249,12 @@ def route_lexical(question, metas, max_docs=12):
     """
     qt = question_tokens(question)
     scored = []
-    terms = {w: QUESTION_TERM_WEIGHT
-             for w in re.findall(r"[\wа-яёА-ЯЁ]{4,}", question.lower())}
+    terms = {}
+    for w in TOKEN_RE.findall(question):
+        if is_designation(w):
+            terms[w] = DESIGNATION_WEIGHT
+        elif len(w) >= 4 and w.lower() not in STOPWORDS:
+            terms[w.lower()] = QUESTION_TERM_WEIGHT
 
     for doc_id, meta in metas.items():
         ru = meta.get("keywords_ru") or []
@@ -450,8 +480,13 @@ def retrieve(doc_ids, terms):
             if rx.search(text):
                 doc_freq[t] += 1
 
+    # Proper idf, and squared: the previous linear form spanned only 1.0-2.8,
+    # so a generic word like "система" hitting four times beat a rare, highly
+    # specific term hitting once. In this corpus almost every document
+    # mentions cables and systems; only the rare terms carry information.
     n_docs = max(1, len(per_doc_chunks))
-    weights = {t: 1.0 + max(0.0, 2.0 - (df * 2.0 / n_docs)) for t, df in doc_freq.items()}
+    weights = {t: (math.log((n_docs + 1) / (df + 1)) + 1.0) ** 2
+               for t, df in doc_freq.items()}
 
     scored = []
     for did, chunks in per_doc_chunks.items():
@@ -460,7 +495,9 @@ def retrieve(doc_ids, terms):
             for t, rx, tw in regs:
                 hits = len(rx.findall(ch))
                 if hits:
-                    s += weights[t] * tw * min(hits, 4)
+                    # sqrt, not a raw count: repeating a common word should
+                    # not outweigh the presence of a discriminating one.
+                    s += weights[t] * tw * math.sqrt(hits)
             if s > 0:
                 # Normative-reference lists are keyword-dense and answer
                 # nothing; discount them rather than dropping them outright,
