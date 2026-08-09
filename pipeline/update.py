@@ -48,22 +48,38 @@ TEXT_CHARS_PER_PAGE = 50   # fewer extractable chars than this = image page
 
 
 def find_claude():
-    """Absolute path to a claude CLI that subprocess can actually launch.
+    """Absolute path to a claude CLI that subprocess can launch cleanly.
 
-    npm installs three shims: `claude` (bash, no extension), `claude.cmd`
-    and `claude.ps1`. Windows can launch only the .cmd, but a bare
-    which("claude") returns the bash shim, which fails with
-    FileNotFoundError and reads as "claude is not installed".
+    npm lays down three shims next to each other - `claude` (a bash script
+    with no extension), `claude.cmd` and `claude.ps1` - plus the real
+    binary at node_modules/@anthropic-ai/claude-code/bin/claude.exe.
+
+    Two traps, both hit on this project:
+      * a bare which("claude") returns the extensionless bash shim, which
+        Windows cannot execute at all (FileNotFoundError, indistinguishable
+        from "claude is not installed");
+      * the .cmd shim re-parses its arguments through cmd.exe, which mangles
+        a multi-line --append-system-prompt into nothing, so claude exits
+        with "Input must be provided ... when using --print".
+
+    So prefer the real .exe, which CreateProcess launches with argv intact.
     """
-    names = ["claude.cmd", "claude.exe", "claude"] if os.name == "nt" else ["claude"]
-    for name in names:
-        p = shutil.which(name)
-        if not p:
-            continue
-        if os.name == "nt" and not p.lower().endswith((".cmd", ".exe", ".bat")):
-            continue
-        return p
-    return None
+    if os.name == "nt":
+        for base in (os.environ.get("APPDATA", ""),
+                     os.environ.get("ProgramFiles", "")):
+            if not base:
+                continue
+            cand = os.path.join(base, "npm", "node_modules", "@anthropic-ai",
+                                "claude-code", "bin", "claude.exe")
+            if os.path.isfile(cand):
+                return cand
+        # Fall back to a shim, .cmd only - never the bash or .ps1 one.
+        for name in ("claude.exe", "claude.cmd"):
+            p = shutil.which(name)
+            if p and p.lower().endswith((".exe", ".cmd")):
+                return p
+        return None
+    return shutil.which("claude")
 
 
 CLAUDE_EXE = find_claude()
