@@ -80,6 +80,57 @@ function Install-Svc {
     & nssm set $Name AppEnvironmentExtra $EnvVars
 }
 
+# ---- ollama --------------------------------------------------------------
+# Ollama ships only as a per-user tray app started from Startup, so after an
+# unattended reboot (Windows update, power cut) the bridge service comes up
+# with no engine behind it and every question fails. Register it as a real
+# service so it is up before anyone logs in.
+#
+# Two settings must be carried explicitly: OLLAMA_MODELS is a USER variable
+# here (models live on D:), invisible to a LocalSystem service, which would
+# otherwise find no models at all. OLLAMA_HOST binds loopback only - the
+# engine has no business being reachable from the wifi.
+$Ollama = (Get-Command ollama -ErrorAction SilentlyContinue).Source
+if (-not $Ollama) {
+    $Ollama = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+}
+if (Test-Path $Ollama) {
+    $models = [Environment]::GetEnvironmentVariable("OLLAMA_MODELS","User")
+    if (-not $models) { $models = [Environment]::GetEnvironmentVariable("OLLAMA_MODELS","Machine") }
+    $ollamaEnv = @(
+        "OLLAMA_HOST=127.0.0.1:11434",
+        # Keep the model resident: default is a 5-minute idle unload, which
+        # makes the first question after a quiet spell pay a cold load.
+        # Nothing else on this machine wants the GPU.
+        "OLLAMA_KEEP_ALIVE=-1"
+    )
+    if ($models) { $ollamaEnv += "OLLAMA_MODELS=$models" }
+
+    & nssm stop standards-ollama 2>$null
+    & nssm remove standards-ollama confirm 2>$null
+    & nssm install standards-ollama $Ollama serve
+    & nssm set standards-ollama AppStdout (Join-Path $LogDir "standards-ollama.log")
+    & nssm set standards-ollama AppStderr (Join-Path $LogDir "standards-ollama.log")
+    & nssm set standards-ollama AppRotateFiles 1
+    & nssm set standards-ollama AppRotateOnline 1
+    & nssm set standards-ollama AppRotateBytes 10485760
+    & nssm set standards-ollama AppExit Default Restart
+    & nssm set standards-ollama AppRestartDelay 3000
+    & nssm set standards-ollama Start SERVICE_AUTO_START
+    & nssm set standards-ollama AppEnvironmentExtra $ollamaEnv
+
+    # Stop the tray app from starting a SECOND server that fights for 11434.
+    $startup = [Environment]::GetFolderPath("Startup")
+    Get-ChildItem $startup -Filter "*llama*" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Move-Item $_.FullName "$($_.FullName).disabled-by-electrobrain" -Force
+            Write-Host "disabled Startup entry: $($_.Name)"
+        }
+    & nssm start standards-ollama
+} else {
+    Write-Host "WARNING: ollama.exe not found - install it, then re-run this script"
+}
+
 # ---- bridge --------------------------------------------------------------
 $askSpawn = '["' + ($Python -replace '\\', '/') + '","' +
             ($BotDir -replace '\\', '/') + '/ask.py","-p","{message}"]'

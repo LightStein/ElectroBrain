@@ -17,13 +17,15 @@ $Root    = "C:\Standards"
 $Gateway = Join-Path $Root "gateway"
 $LogDir  = Join-Path $Root "logs"
 $Pipe    = "\\.\pipe\standards-bridge"
-$Services = @{ bot = "standards-bot"; bridge = "standards-bridge" }
+$Services = @{ bot = "standards-bot"; bridge = "standards-bridge"; ollama = "standards-ollama" }
 
 function Svc-List {
     param($Which)
     if ($Which -eq "bot")    { return @("standards-bot") }
     if ($Which -eq "bridge") { return @("standards-bridge") }
-    return @("standards-bridge", "standards-bot")
+    if ($Which -eq "ollama") { return @("standards-ollama") }
+    # ollama first: the bridge is useless without an engine behind it
+    return @("standards-ollama", "standards-bridge", "standards-bot")
 }
 
 function Bridge-Health {
