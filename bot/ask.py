@@ -59,14 +59,14 @@ HISTORY_FILE = os.environ.get("ASK_HISTORY_FILE", os.path.join(ROOT, "state", "a
 # At the measured ~114 tok/s prompt processing, 12000 chars of context was
 # ~5000 tokens = ~44s of prompt processing before generation even begins.
 # 6000 keeps the answer call inside a usable chat latency.
-MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "6000"))
+MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "14000"))
 # Per-chunk size. At 2500 the 6000-char budget fit only TWO chunks, so a
 # single document could take both slots and crowd out the one that actually
 # held the answer - observed with a switch-height question where СП 256 was
 # correctly shortlisted but never made it into the context. Smaller chunks
 # mean more documents represented for the same number of tokens.
 CHUNK_CHARS = int(os.environ.get("ASK_CHUNK_CHARS", "1200"))
-MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "2"))
+MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "3"))
 # The question's own words matter far more than keywords expanded from
 # meta.json; weighting them equally is what let reference lists outrank real
 # clauses.
@@ -76,6 +76,8 @@ EXPANDED_TERM_WEIGHT = 1.0
 # if the user says TN-C or IP44, chunks containing it are almost certainly
 # the right ones.
 DESIGNATION_WEIGHT = 8.0
+EXPANDED_QUERY_WEIGHT = 2.0
+MAX_CHUNKS = int(os.environ.get("ASK_MAX_CHUNKS", "14"))
 # A chunk that is mostly "ГОСТ Р 55842-2013 (ИСО 30061:2007) ..." is a
 # normative-references list. It matches many terms and answers nothing.
 REFLIST_RE = re.compile(r"(ГОСТ|МЭК|ИСО|IEC|ISO|СП|СНиП|EN)\s*[Р\s]*[\d.\-]{3,}", re.I)
@@ -85,6 +87,9 @@ AUTO_ESCALATE = os.environ.get("ASK_AUTO_ESCALATE", "0") == "1"
 # "lexical" (default) routes without a model - see stage A. "llm" keeps the
 # original catalog-in-prompt router, retained for comparison.
 ROUTER = os.environ.get("ASK_ROUTER", "lexical")
+# Precision is worth more than speed here (Anri, explicitly), so the
+# synonym pass is on by default despite costing a model call.
+EXPAND_QUERY = os.environ.get("ASK_EXPAND", "1") == "1"
 CLAUDE_MODEL = os.environ.get("ASK_CLAUDE_MODEL", "haiku")
 PRO_PROMPT_FILE = os.environ.get("ASK_PRO_PROMPT", os.path.join(SCRIPT_DIR, "pro-prompt.md"))
 
@@ -160,6 +165,46 @@ def ollama_chat(messages, think, want_json=False, timeout=300):
     return content
 
 
+
+
+# ------------------------------------------------ stage A2: query expansion
+#
+# The measured failure mode is synonymy, not inflection: "газовой трубы" vs
+# "газопроводов", "розеточная группа" vs "штепсельные розетки". No stemmer
+# bridges those - they are different words for the same thing, and standards
+# use the formal register while people ask in the colloquial one.
+#
+# So spend a model call turning the question into the vocabulary the
+# DOCUMENTS use. This costs ~15s, which is the right trade when precision
+# matters more than speed.
+
+EXPAND_SYSTEM = """Ты помогаешь искать по русским нормативным документам \
+(электроустановки, пожарная безопасность, заземление, молниезащита).
+
+Дан вопрос обычными словами. Верни СТРОГО JSON без пояснений:
+{"terms": ["...", "..."]}
+
+15-25 слов и коротких словосочетаний, которые РЕАЛЬНО встречаются в тексте \
+нормативных документов по этой теме. Обязательно включи:
+- официальные термины вместо разговорных: "газовая труба" -> "газопровод", \
+"розетка" -> "штепсельная розетка", "провод" -> "проводник"
+- однокоренные и родственные слова
+- аббревиатуры и обозначения: УЗО, ПУЭ, ГОСТ, IP, TN-C, PE, N
+- английские эквиваленты, если документ может быть на английском
+Только термины, без объяснений."""
+
+
+def expand_query(question):
+    """Ask the model for the vocabulary the documents actually use."""
+    msgs = [{"role": "system", "content": EXPAND_SYSTEM},
+            {"role": "user", "content": question}]
+    try:
+        raw = ollama_chat(msgs, think=False, want_json=True, timeout=180)
+        terms = json.loads(raw).get("terms") or []
+        return [t for t in terms if isinstance(t, str) and 2 < len(t) < 60]
+    except (ValueError, OSError) as e:
+        log(f"expand failed ({e}); continuing without expansion")
+        return []
 
 # ------------------------------------------------- stage A: lexical routing
 #
@@ -239,7 +284,7 @@ def load_meta_index():
     return out
 
 
-def route_lexical(question, metas, max_docs=12):
+def route_lexical(question, metas, max_docs=12, expanded=None):
     """Pick candidate documents and build WEIGHTED bilingual search terms.
 
     The question's own words are the real signal; expanded keywords only
@@ -255,6 +300,18 @@ def route_lexical(question, metas, max_docs=12):
             terms[w] = DESIGNATION_WEIGHT
         elif len(w) >= 4 and w.lower() not in STOPWORDS:
             terms[w.lower()] = QUESTION_TERM_WEIGHT
+    # Model-supplied synonyms sit between the question's own words and the
+    # catalogue keywords: more trustworthy than a keyword that merely tagged
+    # the document, less than what the user actually typed.
+    for t in (expanded or []):
+        for w in TOKEN_RE.findall(t):
+            if is_designation(w):
+                terms.setdefault(w, DESIGNATION_WEIGHT)
+            elif len(w) >= 4 and w.lower() not in STOPWORDS:
+                terms.setdefault(w.lower(), EXPANDED_QUERY_WEIGHT)
+    # expansion also widens the document shortlist
+    qt = qt | {norm_token(w) for t in (expanded or [])
+               for w in TOKEN_RE.findall(t) if len(w) >= 4}
 
     for doc_id, meta in metas.items():
         ru = meta.get("keywords_ru") or []
@@ -522,7 +579,7 @@ def retrieve(doc_ids, terms):
         out.append((did, ch))
         per_doc[did] = per_doc.get(did, 0) + 1
         used += len(ch)
-        if len(out) >= 8:
+        if len(out) >= MAX_CHUNKS:
             break
     return out
 
@@ -679,7 +736,11 @@ def main():
     if ROUTER == "llm":
         terms, doc_ids = route(question, catalog_text, history)
     else:
-        terms, doc_ids = route_lexical(question, load_meta_index())
+        expanded = expand_query(question) if EXPAND_QUERY else []
+        if expanded:
+            log(f"expanded: {expanded[:12]}")
+            progress("🔎 Ищу синонимы…")
+        terms, doc_ids = route_lexical(question, load_meta_index(), expanded=expanded)
     # Small models occasionally hallucinate ids — keep only real ones. An empty
     # list makes retrieve() scan the whole corpus, which is the safe fallback.
     doc_ids = [d for d in doc_ids if d in titles]
