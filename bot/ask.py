@@ -377,6 +377,24 @@ def split_chunks(text, max_chars=CHUNK_CHARS):
     return chunks
 
 
+def russian_stem(w):
+    """Prefix stem for Russian inflection.
+
+    Cutting only the last two characters is not enough: "розеточной" became
+    "розеточн", which cannot match "розеток" - and that is exactly how a
+    question about socket circuits missed a clause about sockets. A fixed
+    short prefix collides the inflections that matter ("розето" matches both)
+    and also catches some compounding ("труб" reaches "трубопровод").
+    """
+    if not re.search(r"[а-яёА-ЯЁ]", w):
+        return w
+    if len(w) > 6:
+        return w[:6]
+    if len(w) >= 5:
+        return w[:4]
+    return w
+
+
 def term_regexes(terms):
     """`terms` may be a dict {term: weight} or a plain iterable."""
     """One regex per WORD, not per term.
@@ -393,9 +411,7 @@ def term_regexes(terms):
         for w in re.findall(r"[\wа-яёА-ЯЁ]+", str(term)):
             if len(w) < 4:
                 continue
-            # Prefix match, tolerant of Russian inflection: "заземлен" also
-            # catches "заземления" / "заземлённый".
-            stem = w[:max(4, len(w) - 2)] if re.search(r"[а-яёА-ЯЁ]", w) and len(w) > 5 else w
+            stem = russian_stem(w)
             key = stem.lower()
             if key in seen:
                 continue
