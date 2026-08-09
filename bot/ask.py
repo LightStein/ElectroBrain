@@ -59,14 +59,18 @@ HISTORY_FILE = os.environ.get("ASK_HISTORY_FILE", os.path.join(ROOT, "state", "a
 # At the measured ~114 tok/s prompt processing, 12000 chars of context was
 # ~5000 tokens = ~44s of prompt processing before generation even begins.
 # 6000 keeps the answer call inside a usable chat latency.
-MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "14000"))
+# Measured, not assumed: 14000 scored WORSE than 6000 on the same question
+# set (2 cited vs 3, and one answer lost its citation entirely). A 4B model
+# does not use a bigger haystack well - the answer gets diluted rather than
+# found. More context is not free accuracy.
+MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "6000"))
 # Per-chunk size. At 2500 the 6000-char budget fit only TWO chunks, so a
 # single document could take both slots and crowd out the one that actually
 # held the answer - observed with a switch-height question where СП 256 was
 # correctly shortlisted but never made it into the context. Smaller chunks
 # mean more documents represented for the same number of tokens.
 CHUNK_CHARS = int(os.environ.get("ASK_CHUNK_CHARS", "1200"))
-MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "3"))
+MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "2"))
 # The question's own words matter far more than keywords expanded from
 # meta.json; weighting them equally is what let reference lists outrank real
 # clauses.
@@ -77,7 +81,7 @@ EXPANDED_TERM_WEIGHT = 1.0
 # the right ones.
 DESIGNATION_WEIGHT = 8.0
 EXPANDED_QUERY_WEIGHT = 2.0
-MAX_CHUNKS = int(os.environ.get("ASK_MAX_CHUNKS", "14"))
+MAX_CHUNKS = int(os.environ.get("ASK_MAX_CHUNKS", "8"))
 # A chunk that is mostly "ГОСТ Р 55842-2013 (ИСО 30061:2007) ..." is a
 # normative-references list. It matches many terms and answers nothing.
 REFLIST_RE = re.compile(r"(ГОСТ|МЭК|ИСО|IEC|ISO|СП|СНиП|EN)\s*[Р\s]*[\d.\-]{3,}", re.I)
