@@ -328,6 +328,13 @@ def route_lexical(question, metas, max_docs=12, expanded=None):
     for doc_id, meta in metas.items():
         ru = meta.get("keywords_ru") or []
         en = meta.get("keywords_en") or []
+        # Corpus-derived vocabulary: what the document actually talks about,
+        # as opposed to what its opening pages announce. No aligned twin, so
+        # it is matched on its own.
+        for kw in (meta.get("keywords_idf") or []):
+            if any(t.startswith(kw[:5]) or kw.startswith(t[:5]) for t in qt if len(t) > 4):
+                score += 2.0
+                hits.append(kw)
         topics = meta.get("topics") or []
         title = meta.get("title") or ""
 

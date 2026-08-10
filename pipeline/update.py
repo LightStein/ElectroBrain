@@ -30,6 +30,7 @@ Deps: pip install pymupdf ; ocrmypdf + tesseract (rus+eng) ; pandoc ; claude CLI
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -58,6 +59,7 @@ CLEANUP_PROMPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clean
 # Opening slice handed to Claude for metadata. Standards state their title,
 # scope and contents up front, so this is plenty and keeps the pass cheap.
 SAMPLE_CHARS = int(os.environ.get("STANDARDS_SAMPLE_CHARS", "14000"))
+DIGEST_HEAD_CHARS = int(os.environ.get("STANDARDS_DIGEST_HEAD", "4000"))
 # Catalog line budget. The whole catalog is embedded in the router prompt on
 # every single question, so its size is a latency and correctness constraint,
 # not cosmetics.
@@ -497,6 +499,61 @@ def stage_markdown(m):
 
 # ------------------------------------------------------------- cleanup
 
+def build_digest(md_path):
+    """Opening text PLUS the document's headings, spread over the whole file.
+
+    A flat first-14k-chars slice saw 0.74% of ПУЭ-7 and stopped inside the
+    table of contents: its meta.json described chapters 1.1-1.9 and mentioned
+    no розетки, no УЗО, no взрывоопасные зоны, no жилые здания. Since routing
+    scores questions against those keywords, whole subject areas of the
+    largest document were unreachable. Now that clause detection is fixed,
+    the headings ARE the table of contents, so sampling them evenly describes
+    the entire document for the same token cost.
+    """
+    with open(md_path, encoding="utf-8") as f:
+        text = f.read()
+    head = text[:DIGEST_HEAD_CHARS]
+    headings = re.findall(r"(?m)^#{2,3} (.+)$", text)
+    budget = SAMPLE_CHARS - len(head)
+    if headings and budget > 0:
+        # even stride so the tail of the document is represented too
+        joined = "\n".join(headings)
+        if len(joined) > budget:
+            step = max(1, len(joined) // budget + 1)
+            headings = headings[::step]
+        head += "\n\n[СОДЕРЖАНИЕ ДОКУМЕНТА - заголовки пунктов]\n" + "\n".join(headings)
+    return head[:SAMPLE_CHARS + DIGEST_HEAD_CHARS]
+
+
+def corpus_idf_keywords(top_n=25):
+    """Terms that are frequent in ONE document and rare across the corpus.
+
+    Free, mechanical, and a better keyword list than a model can write from a
+    cover page - it is derived from what the document actually talks about
+    rather than what its first pages announce.
+    """
+    import collections
+    docs, df = {}, collections.Counter()
+    for doc_id in sorted(os.listdir(DOCS) if os.path.isdir(DOCS) else []):
+        fp = os.path.join(DOCS, doc_id, "full.md")
+        if not os.path.isfile(fp):
+            continue
+        with open(fp, encoding="utf-8") as f:
+            words = re.findall(r"[А-Яа-яЁё]{5,}", f.read().lower())
+        tf = collections.Counter(w[:8] for w in words)
+        docs[doc_id] = tf
+        for w in tf:
+            df[w] += 1
+    n = max(1, len(docs))
+    out = {}
+    for doc_id, tf in docs.items():
+        scored = [(c * math.log(n / df[w]), w) for w, c in tf.items()
+                  if 1 < df[w] < n * 0.5 and c >= 3]
+        scored.sort(reverse=True)
+        out[doc_id] = [w for _, w in scored[:top_n]]
+    return out
+
+
 def stage_meta(m, limit=None):
     """Claude produces ONLY meta.json + the catalog line, from a sample.
 
@@ -523,8 +580,7 @@ def stage_meta(m, limit=None):
         # A sample is enough: standards put the title, scope and contents up
         # front. Reading 3.4M chars of ПУЭ-7 to name it would be absurd.
         try:
-            with open(md_path, encoding="utf-8") as f:
-                sample = f.read(SAMPLE_CHARS)
+            sample = build_digest(md_path)
         except OSError:
             continue
         sample_file = os.path.join(WORK, "sample.txt")
@@ -554,6 +610,35 @@ def stage_meta(m, limit=None):
         except subprocess.TimeoutExpired:
             log(f"meta TIMEOUT: {doc_id}")
         save_manifest(m)
+
+
+def merge_idf_keywords():
+    """Append each document's own distinctive vocabulary to its meta.json.
+
+    Costs nothing and needs no model. Stored separately from keywords_ru so a
+    later meta re-run never clobbers it, and so the router can weight
+    model-written keywords and corpus-derived ones differently.
+    """
+    try:
+        idf = corpus_idf_keywords()
+    except Exception as e:
+        log(f"idf keywords skipped: {e}")
+        return
+    n = 0
+    for doc_id, words in idf.items():
+        mp = os.path.join(DOCS, doc_id, "meta.json")
+        if not os.path.isfile(mp):
+            continue
+        try:
+            with open(mp, encoding="utf-8") as f:
+                meta = json.load(f)
+            meta["keywords_idf"] = words
+            with open(mp, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=1)
+            n += 1
+        except (OSError, ValueError):
+            continue
+    log(f"idf keywords: added to {n} document(s)")
 
 
 def rebuild_catalog(m):
@@ -672,6 +757,7 @@ def main():
     stage_markdown(m)
     if not args.skip_claude:
         stage_meta(m, limit=args.limit)
+    merge_idf_keywords()
     rebuild_catalog(m)
 
     statuses = {}
