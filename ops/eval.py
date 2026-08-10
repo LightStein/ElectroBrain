@@ -50,13 +50,20 @@ CONTROL = "какой курс доллара к евро сегодня?"
 CITE_RE = re.compile(r"📄\s*\S|п\.\s*\d|пункт\s*\d", re.I)
 NOTFOUND_RE = re.compile(r"не нашёл|не найдено|прямого ответа нет|NOT_FOUND", re.I)
 ERROR_RE = re.compile(r"usage:|Traceback|error:|Внутренняя ошибка|недоступна", re.I)
-# A refusal, in either engine's wording. The control passes only by matching
-# this and naming no rate.
-REFUSAL_RE = re.compile(r"вне моей области|не знаю|не могу|не располагаю|"
-                        r"не работаю|не о курсах|не нашёл|не найдено", re.I)
-RATE_RE = re.compile(r"\d[\d\s.,]*\s*(?:руб|USD|EUR|евро|доллар|₽|\$)", re.I)
-# ask.py logs these to stderr when it hands a question to claude.
+# The control is judged on what it must NOT contain, not on how it phrases the
+# refusal. A phrase list was tried first and immediately produced a false
+# alarm: the assistant refused with "я специализируюсь ... а не на курсах
+# валют", which matched none of the expected wordings. There are unlimited
+# ways to say no and only two ways to fail - quote a rate, or cite a standard
+# for a question no standard covers.
+RATE_RE = re.compile(r"\d[\d\s.,]*\s*(?:руб|USD|EUR|евро|доллар|₽|\$)"
+                     r"|(?:курс|USD|EUR|евро|доллар)\D{0,20}\d+[.,]\d+", re.I)
+# ask.py logs these to stderr when it hands a question to claude. The reason
+# matters as much as the count: escalating because qwen found nothing is the
+# system working, while escalating because the citation check rejected a good
+# answer is the check costing money for no benefit.
 ESCALATED_RE = re.compile(r"local answer rejected|Подключаю сильную модель", re.I)
+REASON_RE = re.compile(r"local answer rejected: (.+)")
 # Measured over the earlier /pro run: ~200k tokens per escalated question.
 COST_PER_ESCALATION = 0.076
 
@@ -72,8 +79,11 @@ def run(question, pro=False):
     # whether the local model answered or claude was called. With
     # auto-escalation on, that is the difference between a free answer and a
     # paid one, so it belongs in the report.
-    escalated = bool(ESCALATED_RE.search(r.stderr or ""))
-    return (r.stdout or "").strip(), time.time() - t0, escalated
+    err = r.stderr or ""
+    escalated = bool(ESCALATED_RE.search(err))
+    m = REASON_RE.search(err)
+    reason = m.group(1).strip() if m else ("no chunks retrieved" if escalated else "")
+    return (r.stdout or "").strip(), time.time() - t0, escalated, reason
 
 
 def main():
@@ -87,18 +97,21 @@ def main():
     print(f"engine: {engine}\n" + "=" * 72)
 
     times, cited, notfound, errors, escalations = [], 0, 0, 0, 0
+    reasons = {}
     control_ok = None
     for q in qs:
-        answer, dt, escalated = run(q, pro=args.pro)
+        answer, dt, escalated, reason = run(q, pro=args.pro)
         times.append(dt)
         escalations += escalated
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
         is_err = bool(ERROR_RE.search(answer))
         errors += is_err
 
         if q == CONTROL:
             # Inverted: a citation here means a source was invented for a
             # question the corpus cannot possibly answer.
-            control_ok = bool(REFUSAL_RE.search(answer)) and not RATE_RE.search(answer)
+            control_ok = not RATE_RE.search(answer) and not CITE_RE.search(answer)
             flag = "control OK (refused)" if control_ok else "CONTROL FAILED"
         else:
             has_cite = bool(CITE_RE.search(answer))
@@ -111,7 +124,7 @@ def main():
         m = re.search(r"📄\s*([^,:\n]{1,70})", answer)
         if m:
             src = " <- " + m.group(1).strip()
-        via = " [escalated]" if escalated else ""
+        via = f" [escalated: {reason}]" if escalated else ""
         print(f"\n[{dt:5.1f}s] [{flag}]{via}{src}\nQ: {q}\nA: {answer[:400]}")
 
     n = len(qs) - (1 if CONTROL in qs else 0)
@@ -122,6 +135,8 @@ def main():
     print(f"escalated to claude: {escalations}/{len(qs)}"
           f"  (~${escalations * COST_PER_ESCALATION:.2f} this run,"
           f" ~${COST_PER_ESCALATION:.3f} each)")
+    for r, c in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        print(f"    {c}x  {r}")
     if times:
         print(f"time: min {min(times):.1f}s  median "
               f"{sorted(times)[len(times)//2]:.1f}s  max {max(times):.1f}s")
