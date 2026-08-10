@@ -698,7 +698,20 @@ def find_claude():
         with "Input must be provided ... when using --print".
 
     So prefer the real .exe, which CreateProcess launches with argv intact.
+
+    Third trap, and the one that actually shipped broken: every path below is
+    discovered relative to the CURRENT user. The bridge runs as a Windows
+    service under LocalSystem, whose %APPDATA% is not George's, so all of this
+    found nothing and escalation failed with "claude CLI not found" - while
+    the same code worked perfectly from an interactive shell, which is where
+    it had been tested. ASK_CLAUDE_BIN pins the absolute path at install time
+    so service context cannot change the answer.
     """
+    pinned = os.environ.get("ASK_CLAUDE_BIN", "").strip()
+    if pinned:
+        if os.path.isfile(pinned):
+            return pinned
+        log(f"ASK_CLAUDE_BIN set but not a file: {pinned}")
     if os.name == "nt":
         for base in (os.environ.get("APPDATA", ""),
                      os.environ.get("ProgramFiles", "")):

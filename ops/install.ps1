@@ -49,6 +49,18 @@ if ((Test-Path "$env:USERPROFILE\.claude.json") -and
     Copy-Item "$env:USERPROFILE\.claude.json" "$ClaudeCfg\.claude.json"
 }
 
+# Same reasoning for the binary itself: resolve it HERE, as the interactive
+# user, because the service cannot find it under LocalSystem's profile. Prefer
+# the real .exe - the npm .cmd shim re-parses argv through cmd.exe and mangles
+# the multi-line system prompt.
+$ClaudeBin = "$env:APPDATA\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
+if (-not (Test-Path $ClaudeBin)) {
+    $shim = (Get-Command claude.cmd -ErrorAction SilentlyContinue).Source
+    if ($shim) { $ClaudeBin = $shim }
+    else { Write-Host "WARNING: claude CLI not found - /pro and auto-escalation will fail" }
+}
+Write-Host "claude CLI: $ClaudeBin"
+
 # Telegram token/user id come from a git-ignored env file, one KEY=VALUE per line.
 $SecretsFile = Join-Path $Root "secrets.env"
 if (-not (Test-Path $SecretsFile)) {
@@ -174,6 +186,11 @@ $bridgeEnv = @(
     # Claude Code CLI (model below) - no Anthropic API key is involved.
     "ASK_AUTO_ESCALATE=1",
     "ASK_CLAUDE_MODEL=haiku",
+    # Absolute path, resolved here as the installing user. The service runs as
+    # LocalSystem, whose %APPDATA% is not George's - without this, every
+    # escalation failed with "claude CLI not found" while the identical code
+    # worked from an interactive shell.
+    "ASK_CLAUDE_BIN=$ClaudeBin",
     "CLAUDE_CONFIG_DIR=$ClaudeCfg",
     # Without these Python writes stdout in the Windows ANSI codepage while
     # node decodes the pipe as UTF-8, so every Russian answer reached Telegram
