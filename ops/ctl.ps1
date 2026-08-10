@@ -60,6 +60,13 @@ function Svc-List {
     return @("standards-ollama", "standards-bridge", "standards-bot")
 }
 
+# ALWAYS wrap calls to this in @(). PowerShell unrolls a one-element array on
+# return, so a single match comes back as a bare CimInstance - and CimInstance
+# brings its own string indexer, so $procs[0] indexes by the property named "0"
+# and yields $null while .Count yields $null too. Both `$null -eq 0` and
+# `$null -gt 1` are false, so the health verdict below would read OK without
+# ever having counted anything. That is the same class of bug as trusting the
+# SCM: a check that cannot fail is not a check.
 function Find-AppProcess {
     param([string]$Name)
     $spec = $AppSpec[$Name]
@@ -94,7 +101,7 @@ function Ollama-Version {
 function Get-SvcState {
     param([string]$Name)
     $svc = Get-Service $Name -ErrorAction SilentlyContinue
-    $procs = Find-AppProcess $Name
+    $procs = @(Find-AppProcess $Name)
     $r = [pscustomobject]@{
         Name    = $Name
         Service = $(if ($svc) { [string]$svc.Status } else { "absent" })
@@ -148,7 +155,7 @@ function Svc-Stop {
     # worker is what actually lets that finish - waiting first only means the
     # subsequent start collides with a service still in StopPending.
     if (-not (Wait-SvcState $Name "Stopped" 8)) {
-        foreach ($p in (Find-AppProcess $Name)) {
+        foreach ($p in @(Find-AppProcess $Name)) {
             if (-not $Quiet) { Write-Host ("  reaping worker pid {0}" -f $p.ProcessId) }
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
@@ -157,7 +164,7 @@ function Svc-Stop {
     # Even a clean stop can leave a worker behind if the supervisor had already
     # been killed: the SCM reports Stopped while the worker keeps running, and
     # starting again would leave two of them.
-    foreach ($p in (Find-AppProcess $Name)) {
+    foreach ($p in @(Find-AppProcess $Name)) {
         if (-not $Quiet) { Write-Host ("  reaping orphaned pid {0}" -f $p.ProcessId) }
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
@@ -188,7 +195,7 @@ function Svc-Start {
     # as the supervisor is up, which is the exact lie this script exists to
     # avoid repeating.
     for ($i = 0; $i -lt 30; $i++) {
-        if ((Find-AppProcess $Name).Count -ge 1) { break }
+        if (@(Find-AppProcess $Name).Count -ge 1) { break }
         Start-Sleep -Seconds 1
     }
     $st = Get-SvcState $Name
