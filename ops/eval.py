@@ -132,9 +132,16 @@ def main():
     print(f"real questions {n} | cited {cited} | not-found {notfound} | errors {errors}")
     if control_ok is not None:
         print(f"control: {'refused correctly' if control_ok else 'FAILED - invented an answer'}")
-    print(f"escalated to claude: {escalations}/{len(qs)}"
-          f"  (~${escalations * COST_PER_ESCALATION:.2f} this run,"
-          f" ~${COST_PER_ESCALATION:.3f} each)")
+    # With escalation off, ask.py still logs the rejection - so the count is
+    # "would have escalated" and nothing was actually spent. Saying "$0.53"
+    # for a run that made no Claude calls would be a straightforward lie.
+    if os.environ.get("ASK_AUTO_ESCALATE", "0") == "1":
+        print(f"escalated to claude: {escalations}/{len(qs)}"
+              f"  (~${escalations * COST_PER_ESCALATION:.2f} at API rates;"
+              f" on a subscription this is plan allowance, not a bill)")
+    else:
+        print(f"would escalate: {escalations}/{len(qs)}"
+              f"  (escalation OFF - no claude calls, nothing spent)")
     for r, c in sorted(reasons.items(), key=lambda kv: -kv[1]):
         print(f"    {c}x  {r}")
     if times:
