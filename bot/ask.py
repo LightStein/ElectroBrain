@@ -104,6 +104,8 @@ PRO_PROMPT_FILE = os.environ.get("ASK_PRO_PROMPT", os.path.join(SCRIPT_DIR, "pro
 
 # A source line: the 📄 marker, or an explicit clause reference.
 CITATION_RE = re.compile(r"📄|\bп\.\s*\d|\bпункт\s*\d", re.I)
+# The verbatim clause the answer claims to be quoting.
+QUOTE_RE = re.compile(r"«([^»]{8,})»")
 
 CATALOG = os.path.join(ROOT, "index", "catalog.md")
 DOCS_DIR = os.path.join(ROOT, "index", "docs")
@@ -632,6 +634,52 @@ def answer(question, ctx_chunks, history, titles_by_id):
     return ollama_chat(msgs, think=THINK_FINAL, timeout=420)
 
 
+# -------------------------------------------------------- citation relevance
+
+def cited_quotes(reply):
+    """The clause texts an answer claims to be quoting."""
+    quotes = QUOTE_RE.findall(reply)
+    if quotes:
+        return quotes
+    # Some answers cite without quote marks. Fall back to whatever follows the
+    # document reference on a citation line.
+    out = []
+    for ln in reply.splitlines():
+        if CITATION_RE.search(ln) and ":" in ln:
+            tail = ln.split(":", 1)[1].strip()
+            if len(tail) >= 8:
+                out.append(tail)
+    return out
+
+
+def citation_is_relevant(question, reply):
+    """Does the quoted clause actually talk about what was asked?
+
+    Checking the shape of a citation only proves the model typed a clause
+    number. In testing one answer cited ПУЭ 1.7.8 for an unrelated question -
+    correct format, wrong clause - and passed. That is the failure most likely
+    to mislead a revisor, because it reads as sourced and gives him a specific
+    reference to act on.
+
+    Deliberately lenient: one shared content word is enough. Standards phrase
+    things in their own vocabulary (a clause about УДТ answers a question about
+    УЗО), and the two errors are not symmetric - escalating a correct answer
+    costs one Claude call, while showing a confidently mis-sourced one costs
+    George's trust in the whole tool. When in doubt, let it through and let the
+    quote speak for itself; he is told to verify against the original anyway.
+    """
+    quotes = cited_quotes(reply)
+    if not quotes:
+        return True                      # nothing quoted; the shape check stands
+    want = question_tokens(question)
+    if not want:
+        return True                      # nothing to match against
+    got = set()
+    for q in quotes:
+        got |= question_tokens(q)
+    return bool(want & got)
+
+
 # ----------------------------------------------------------- claude escalate
 
 def find_claude():
@@ -787,23 +835,39 @@ def main():
     reply = answer(question, chunks, history, titles)
     log(f"answer {time.time()-t0:.1f}s")
 
-    # Enforce the citation contract in CODE, not just in the prompt. An
-    # answer without a source is the dangerous failure here: it reads as
-    # authoritative and gives a revisor nothing to verify against. Observed
-    # twice in testing, so the prompt alone is not sufficient.
-    if "NOT_FOUND" not in reply and not CITATION_RE.search(reply):
-        log("answer had no citation - refusing to present it as sourced")
-        reply = ("Нашёл похожий текст, но не смог указать точный пункт "
-                 "документа — не показываю такой ответ.\n"
-                 "Спроси сильную модель: /pro " + question[:150])
-
+    # Enforce the citation contract in CODE, not just in the prompt. An answer
+    # without a source - or with one that does not match the question - is the
+    # dangerous failure here: it reads as authoritative and gives a revisor
+    # something specific to act on. Observed twice in testing, so the prompt
+    # alone is not sufficient.
+    #
+    # All three rejections converge on one decision below. They used to be
+    # separate branches, and the citation branch overwrote `reply` before the
+    # NOT_FOUND branch tested it - so with AUTO_ESCALATE on, a missing or
+    # mis-matched citation silently dead-ended instead of escalating, covering
+    # two of the three failure modes rather than three.
+    reason, fallback = None, None
     if "NOT_FOUND" in reply:
+        reason = "qwen found nothing usable in the retrieved fragments"
+        fallback = ("В найденных фрагментах прямого ответа нет. "
+                    "Попробуй переформулировать или спроси сильную модель: ")
+    elif not CITATION_RE.search(reply):
+        reason = "no citation in the answer"
+        fallback = ("Нашёл похожий текст, но не смог указать точный пункт "
+                    "документа — не показываю такой ответ.\n"
+                    "Спроси сильную модель: ")
+    elif not citation_is_relevant(question, reply):
+        reason = "cited clause shares no vocabulary with the question"
+        fallback = ("Нашёл ссылку на пункт, но он не про то, о чём вопрос — "
+                    "не показываю такой ответ.\n"
+                    "Спроси сильную модель: ")
+
+    if reason:
+        log(f"local answer rejected: {reason}")
         if AUTO_ESCALATE:
             reply = escalate_claude(question, history)
         else:
-            reply = ("В найденных фрагментах прямого ответа нет. "
-                     "Попробуй переформулировать или спроси сильную модель: "
-                     "/pro " + question[:150])
+            reply = fallback + "/pro " + question[:150]
 
     print(reply)
     history.append({"q": question, "a": reply})

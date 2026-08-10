@@ -168,6 +168,12 @@ $bridgeEnv = @(
     "STANDARDS_RAW=D:\LLM_FILES",
     "OLLAMA_URL=http://127.0.0.1:11434",
     "ASK_MODEL=qwen3:4b-instruct",
+    # When the local model finds nothing, cites nothing, or cites something
+    # unrelated, hand the question to claude rather than telling George to
+    # retype it as /pro. Costs roughly $0.076 per escalated question via the
+    # Claude Code CLI (model below) - no Anthropic API key is involved.
+    "ASK_AUTO_ESCALATE=1",
+    "ASK_CLAUDE_MODEL=haiku",
     "CLAUDE_CONFIG_DIR=$ClaudeCfg",
     # Without these Python writes stdout in the Windows ANSI codepage while
     # node decodes the pipe as UTF-8, so every Russian answer reached Telegram
