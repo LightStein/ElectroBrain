@@ -195,5 +195,25 @@ Install-Svc "standards-bot" $Gateway (Join-Path $Gateway "bot.js") $botEnv
 & nssm start standards-bridge
 & nssm start standards-bot
 
+# ---- self-heal task ------------------------------------------------------
+# NSSM restarts a worker that exits, which covers a crash. It does NOT cover
+# the two states that actually took this system down: a supervisor that is
+# gone (SCM keeps reporting Running forever, nothing left to restart anything)
+# and a bot that is running but no longer reaching Telegram. ctl.ps1 heal
+# detects both by looking at the worker process and the bot's heartbeat, and
+# restarts only what is broken. Five minutes is the worst case George waits.
+$healCmd = "-NoProfile -ExecutionPolicy Bypass -File `"$Root\ops\ctl.ps1`" heal"
+$action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $healCmd
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+           -RepetitionInterval (New-TimeSpan -Minutes 5)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries -StartWhenAvailable `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+            -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName "standards-heal" -Action $action `
+    -Trigger $trigger -Settings $settings -User "SYSTEM" `
+    -RunLevel Highest -Force | Out-Null
+Write-Host "registered scheduled task standards-heal (every 5 min)"
+
 Write-Host ""
 Write-Host "Installed. Use ops\ctl.ps1 status to check, ctl.ps1 logs bot to tail."

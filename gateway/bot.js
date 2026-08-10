@@ -703,17 +703,52 @@ bot.on('text', async (msg) => {
 const POLL_ERR_LIMIT = 5;
 let pollErrorStreak = 0;
 let bailing = false;
+// Declared before bailForRestart so an early uncaughtException cannot trip
+// over the temporal dead zone on its way out.
+let heartbeatTimer = null;
 
 function bailForRestart(reason) {
   if (bailing) return;
   bailing = true;
   console.error(`[watchdog] exiting for a clean restart: ${reason}`);
+  // Stop the heartbeat first: from this moment the process is deliberately on
+  // its way out, and anything watching from outside should see it go stale
+  // even if the exit below is delayed or never happens.
+  clearInterval(heartbeatTimer);
+  try { fs.unlinkSync(HEARTBEAT_FILE); } catch {}
   try { bot.stopPolling({ cancel: true }); } catch {}
-  setTimeout(() => process.exit(1), 1000);
+  // The old code waited a full second on a timer before exiting, to let the
+  // log line above flush. That is fine when the loop is healthy and worthless
+  // when it is not: a blocked loop never runs the timer, and the process sits
+  // there alive but deaf, which looks identical to "working" from the service
+  // manager's point of view. Exit on the next tick instead, and accept that no
+  // in-process guard can cover a fully wedged loop - that is what the
+  // heartbeat file above is for, and ops/ctl.ps1 is what acts on it.
+  setImmediate(() => process.exit(1));
+  setTimeout(() => process.exit(1), 500).unref();
 }
 
 function noteLiveActivity() { pollErrorStreak = 0; }
 bot.on('message', noteLiveActivity);
+
+// Liveness stamp for outside observers. Windows reports a service as Running
+// whenever its supervisor holds the slot, which stayed true here for 2.5h
+// while the bot was gone entirely - so service state cannot be the health
+// signal. The stamp is only refreshed while the process is BOTH running its
+// event loop AND not in a polling-error streak, which makes a stale file mean
+// "not answering Telegram" rather than merely "not scheduled recently".
+const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE || path.join(RUN_DIR, 'bot.alive');
+const HEARTBEAT_MS = 30 * 1000;
+
+function beat() {
+  if (bailing || pollErrorStreak !== 0) return;
+  try { fs.writeFileSync(HEARTBEAT_FILE, new Date().toISOString()); } catch {}
+}
+
+try { fs.mkdirSync(RUN_DIR, { recursive: true }); } catch {}
+heartbeatTimer = setInterval(beat, HEARTBEAT_MS);
+heartbeatTimer.unref();
+beat();
 
 bot.on('polling_error', (err) => {
   pollErrorStreak++;
