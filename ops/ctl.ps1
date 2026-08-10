@@ -129,28 +129,60 @@ function Get-SvcState {
     return $r
 }
 
+function Wait-SvcState {
+    param([string]$Name, [string]$Want, [int]$Seconds = 20)
+    for ($i = 0; $i -lt $Seconds; $i++) {
+        $s = Get-Service $Name -ErrorAction SilentlyContinue
+        if (-not $s) { return $true }
+        if ($s.Status -eq $Want) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
 function Svc-Stop {
     param([string]$Name, [switch]$Quiet)
     & sc.exe stop $Name 2>&1 | Out-Null
-    for ($i = 0; $i -lt 30; $i++) {
-        $s = Get-Service $Name -ErrorAction SilentlyContinue
-        if (-not $s -or $s.Status -eq "Stopped") { break }
-        Start-Sleep -Seconds 1
+    # Reap the worker early rather than after a long wait. NSSM parks the
+    # service in StopPending while it coaxes the worker down, and killing the
+    # worker is what actually lets that finish - waiting first only means the
+    # subsequent start collides with a service still in StopPending.
+    if (-not (Wait-SvcState $Name "Stopped" 8)) {
+        foreach ($p in (Find-AppProcess $Name)) {
+            if (-not $Quiet) { Write-Host ("  reaping worker pid {0}" -f $p.ProcessId) }
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Wait-SvcState $Name "Stopped" 20 | Out-Null
     }
-    # Reap anything the supervisor left behind. When the wrapper was already
-    # dead, the SCM happily reports Stopped while the worker keeps running -
-    # and starting the service again would then leave two of them.
-    $orphans = Find-AppProcess $Name
-    foreach ($p in $orphans) {
+    # Even a clean stop can leave a worker behind if the supervisor had already
+    # been killed: the SCM reports Stopped while the worker keeps running, and
+    # starting again would leave two of them.
+    foreach ($p in (Find-AppProcess $Name)) {
         if (-not $Quiet) { Write-Host ("  reaping orphaned pid {0}" -f $p.ProcessId) }
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    if ($orphans.Count) { Start-Sleep -Seconds 2 }
+    # Last resort: the supervisor itself is wedged. Killing the service process
+    # makes the SCM notice and mark the service Stopped, which is the only way
+    # out of a permanent StopPending short of a reboot.
+    $svc = Get-Service $Name -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne "Stopped") {
+        $wrapper = Get-CimInstance Win32_Service | Where-Object { $_.Name -eq $Name }
+        if ($wrapper -and $wrapper.ProcessId -gt 0) {
+            if (-not $Quiet) { Write-Host ("  supervisor wedged; killing pid {0}" -f $wrapper.ProcessId) }
+            Stop-Process -Id $wrapper.ProcessId -Force -ErrorAction SilentlyContinue
+            Wait-SvcState $Name "Stopped" 15 | Out-Null
+        }
+    }
     if (-not $Quiet) { Write-Host "stopped $Name" }
 }
 
 function Svc-Start {
     param([string]$Name, [switch]$Quiet)
+    # sc.exe start fails outright against a service still in StopPending, so
+    # settle first. Without this a restart reports FAILED for a service that
+    # was merely a second away from being startable.
+    $svc = Get-Service $Name -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne "Stopped") { Wait-SvcState $Name "Stopped" 20 | Out-Null }
     & sc.exe start $Name 2>&1 | Out-Null
     # Wait for the worker, not the service: the service reports Running as soon
     # as the supervisor is up, which is the exact lie this script exists to
