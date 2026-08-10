@@ -46,14 +46,37 @@ all carried over from lessons that cost real outages in the original.
 | `bot/ask.py` | The answering engine — routing, retrieval, citation, escalation |
 | `gateway/` | Telegram bot + per-project bridge (named pipes on Windows) |
 | `pipeline/update.py` | Scan → extract → OCR → cleanup, manifest-driven and resumable |
-| `ops/install.ps1` | Registers the NSSM services |
-| `ops/ctl.ps1` | `status` / `start` / `stop` / `restart-when-idle` / `logs` / `ask` |
+| `ops/install.ps1` | Registers the NSSM services and the `standards-heal` task |
+| `ops/ctl.ps1` | `status` / `start` / `stop` / `restart` / `heal` / `restart-when-idle` / `logs` / `ask` |
 | `ops/laptop-setup/` | One-shot SSH + Cloudflare tunnel setup for the laptop |
 | `Update-Standards.bat` | George's single button after adding or removing a document |
 | `PLAN.md` | Full design, decisions, test results, remaining phases |
 
 Deploys to `C:\Standards\` on the laptop; `index\` doubles as an Obsidian vault
 so the corpus stays browsable by hand.
+
+### Health, and why `Get-Service` is not it
+
+Windows reports a service as Running whenever its supervisor holds the slot.
+NSSM is that supervisor, so if the `nssm.exe` wrapper dies — which a hung
+`nssm restart` invites — the SCM keeps saying Running while the worker is gone,
+and `AppExit=Restart` never fires because nothing is left to fire it. That state
+once cost 2.5h of silence with all three services showing green.
+
+`ctl.ps1 status` therefore checks the **worker process** and, for the bot, a
+heartbeat file it rewrites every 30s only while polling cleanly. Verdicts:
+
+| | |
+|---|---|
+| `OK` | worker present, and for the bot a fresh heartbeat |
+| `ZOMBIE` | service Running, no worker — the silent-downtime state |
+| `DUPLICATE` | two workers; for the bot that means duelling `getUpdates` loops |
+| `DEAF` | bot alive but heartbeat stale: not reaching Telegram |
+| `STARTING` / `STOPPING` | mid-transition, not a failure |
+
+`ctl.ps1 heal` restarts only what is broken, and the `standards-heal` scheduled
+task runs it every 5 minutes, so the worst case is ~5 minutes of downtime with
+nobody watching. Exit code is 0 only when everything is healthy.
 
 ## Setup
 
