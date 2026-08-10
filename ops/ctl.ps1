@@ -110,12 +110,26 @@ function Get-SvcState {
         Verdict = "OK"
         Note    = ""
     }
-    if (-not $svc)                    { $r.Verdict = "NOT INSTALLED"; return $r }
-    if ($r.Service -ne "Running")     { $r.Verdict = "STOPPED"; $r.Note = "service is $($r.Service)"; return $r }
+    if (-not $svc) { $r.Verdict = "NOT INSTALLED"; return $r }
+    # NSSM parks the service in StartPending for the length of its throttle
+    # window (10s) after every start, and in StopPending while it winds a
+    # worker down. Those are transient, not failures - calling them STOPPED
+    # made `heal` restart a bot that had just come up healthy, which loops
+    # forever. Judge on the worker process; use service state only to tell a
+    # deliberate stop apart from one that should be running.
+    if ($r.Service -eq "Stopped" -or $r.Service -eq "Paused") {
+        $r.Verdict = "STOPPED"; $r.Note = "service is $($r.Service)"; return $r
+    }
     if ($procs.Count -eq 0) {
+        if ($r.Service -eq "StartPending") {
+            $r.Verdict = "STARTING"; $r.Note = "worker has not appeared yet"; return $r
+        }
         $r.Verdict = "ZOMBIE"
         $r.Note = "service says Running but no worker process exists"
         return $r
+    }
+    if ($r.Service -eq "StopPending") {
+        $r.Verdict = "STOPPING"; $r.Note = "worker is winding down"; return $r
     }
     if ($procs.Count -gt 1) {
         # Two bots means two getUpdates loops: 409 storms and duplicate replies.
@@ -134,6 +148,26 @@ function Get-SvcState {
         }
     }
     return $r
+}
+
+# STARTING and STOPPING are snapshots of a service mid-transition. Reporting
+# them as failures would make every check taken seconds after a restart lie in
+# the opposite direction to the one this script exists to fix.
+function Is-Transient {
+    param([string]$Verdict)
+    return ($Verdict -eq "STARTING" -or $Verdict -eq "STOPPING")
+}
+
+# Let a transition finish before judging it, so both `status` and `heal` report
+# what the service settled on rather than what it was passing through.
+function Get-SvcStateSettled {
+    param([string]$Name, [int]$Seconds = 30)
+    $st = Get-SvcState $Name
+    for ($i = 0; $i -lt $Seconds -and (Is-Transient $st.Verdict); $i++) {
+        Start-Sleep -Seconds 1
+        $st = Get-SvcState $Name
+    }
+    return $st
 }
 
 function Wait-SvcState {
@@ -198,9 +232,17 @@ function Svc-Start {
         if (@(Find-AppProcess $Name).Count -ge 1) { break }
         Start-Sleep -Seconds 1
     }
-    $st = Get-SvcState $Name
+    # The bot needs a moment to write its first heartbeat, and NSSM holds
+    # StartPending through its throttle window; settle before judging.
+    $st = Get-SvcStateSettled $Name 30
+    if ($st.Verdict -eq "DEAF") {
+        for ($i = 0; $i -lt 15 -and $st.Verdict -eq "DEAF"; $i++) {
+            Start-Sleep -Seconds 1
+            $st = Get-SvcState $Name
+        }
+    }
     if (-not $Quiet) {
-        if ($st.Verdict -eq "OK" -or $st.Verdict -eq "DEAF") {
+        if ($st.Verdict -eq "OK") {
             Write-Host ("started {0} (pid {1})" -f $Name, $st.Pid)
         } else {
             Write-Host ("FAILED to start {0}: {1} {2}" -f $Name, $st.Verdict, $st.Note)
@@ -217,7 +259,7 @@ function Svc-Restart {
 function Show-Status {
     $bad = 0
     foreach ($name in $AppSpec.Keys) {
-        $st = Get-SvcState $name
+        $st = Get-SvcStateSettled $name 30
         if ($st.Verdict -ne "OK") { $bad++ }
         $detail = "service=$($st.Service)"
         if ($st.Pid) { $detail += " pid=$($st.Pid)" }
@@ -252,21 +294,32 @@ switch ($Cmd) {
         # unattended from a scheduled task, so it stays quiet when all is well.
         $fixed = @()
         foreach ($name in $AppSpec.Keys) {
-            $st = Get-SvcState $name
+            $st = Get-SvcStateSettled $name 30
             if ($st.Verdict -eq "NOT INSTALLED") { continue }
-            if ($st.Verdict -ne "OK") {
-                Write-Host ("[heal] {0} is {1} ({2}) - restarting" -f $name, $st.Verdict, $st.Note)
-                Svc-Restart $name
-                $fixed += $name
-            }
+            if ($st.Verdict -eq "OK") { continue }
+            # Confirm before acting. A single bad reading is not enough to
+            # justify killing a working service, and an unnecessary restart
+            # drops whatever question George had in flight.
+            Start-Sleep -Seconds 5
+            $st = Get-SvcStateSettled $name 15
+            if ($st.Verdict -eq "OK") { continue }
+            Write-Host ("[heal] {0} is {1} ({2}) - restarting" -f $name, $st.Verdict, $st.Note)
+            Svc-Restart $name
+            $fixed += $name
         }
         # A bridge that answers no longer proves much on its own if the bot in
         # front of it was just replaced; probing after the fact is what catches
         # a restart that came back up broken.
-        if (-not (Bridge-Health)) {
-            Write-Host "[heal] bridge unreachable after checks - restarting bridge"
-            Svc-Restart "standards-bridge"
-            $fixed += "standards-bridge"
+        if (-not ($fixed -contains "standards-bridge")) {
+            $h = Bridge-Health
+            # One failed probe can just be a slow pipe connect; confirm before
+            # restarting, since a bridge restart kills any answer in flight.
+            if (-not $h) { Start-Sleep -Seconds 5; $h = Bridge-Health }
+            if (-not $h) {
+                Write-Host "[heal] bridge process is up but the pipe does not answer - restarting"
+                Svc-Restart "standards-bridge"
+                $fixed += "standards-bridge"
+            }
         }
         if ($fixed.Count -eq 0) { exit 0 }
         Write-Host ("[heal] restarted: {0}" -f ($fixed -join ", "))
