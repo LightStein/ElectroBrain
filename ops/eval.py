@@ -43,12 +43,22 @@ QUESTIONS = [
     "какая степень защиты IP нужна для светильника в душевой?",
     "на каком расстоянии от газовой трубы можно вести проводку?",
     "чем отличается система TN-C от TN-S?",
-    "какой курс доллара к евро сегодня?",   # must NOT invent an answer
 ]
+# Judged by the opposite rule to everything above: answering it is the failure.
+CONTROL = "какой курс доллара к евро сегодня?"
 
-CITE_RE = re.compile(r"📄|п\.\s*\d|пункт\s*\d", re.I)
+CITE_RE = re.compile(r"📄\s*\S|п\.\s*\d|пункт\s*\d", re.I)
 NOTFOUND_RE = re.compile(r"не нашёл|не найдено|прямого ответа нет|NOT_FOUND", re.I)
 ERROR_RE = re.compile(r"usage:|Traceback|error:|Внутренняя ошибка|недоступна", re.I)
+# A refusal, in either engine's wording. The control passes only by matching
+# this and naming no rate.
+REFUSAL_RE = re.compile(r"вне моей области|не знаю|не могу|не располагаю|"
+                        r"не работаю|не о курсах|не нашёл|не найдено", re.I)
+RATE_RE = re.compile(r"\d[\d\s.,]*\s*(?:руб|USD|EUR|евро|доллар|₽|\$)", re.I)
+# ask.py logs these to stderr when it hands a question to claude.
+ESCALATED_RE = re.compile(r"local answer rejected|Подключаю сильную модель", re.I)
+# Measured over the earlier /pro run: ~200k tokens per escalated question.
+COST_PER_ESCALATION = 0.076
 
 
 def run(question, pro=False):
@@ -58,7 +68,12 @@ def run(question, pro=False):
     r = subprocess.run([py, ASK, "-p", prompt, "--fresh"],
                        capture_output=True, text=True, encoding="utf-8",
                        cwd=os.path.join(ROOT, "bot"), timeout=600)
-    return (r.stdout or "").strip(), time.time() - t0
+    # stderr carries ask.py's own log, which is the only place that says
+    # whether the local model answered or claude was called. With
+    # auto-escalation on, that is the difference between a free answer and a
+    # paid one, so it belongs in the report.
+    escalated = bool(ESCALATED_RE.search(r.stderr or ""))
+    return (r.stdout or "").strip(), time.time() - t0, escalated
 
 
 def main():
@@ -67,36 +82,54 @@ def main():
     ap.add_argument("-q", "--question", help="ask one question instead of the set")
     args = ap.parse_args()
 
-    qs = [args.question] if args.question else QUESTIONS
+    qs = [args.question] if args.question else (QUESTIONS + [CONTROL])
     engine = "claude (/pro)" if args.pro else os.environ.get("ASK_MODEL", "local")
     print(f"engine: {engine}\n" + "=" * 72)
 
-    times, cited, notfound, errors = [], 0, 0, 0
+    times, cited, notfound, errors, escalations = [], 0, 0, 0, 0
+    control_ok = None
     for q in qs:
-        answer, dt = run(q, pro=args.pro)
+        answer, dt, escalated = run(q, pro=args.pro)
         times.append(dt)
-        has_cite = bool(CITE_RE.search(answer))
-        is_nf = bool(NOTFOUND_RE.search(answer))
+        escalations += escalated
         is_err = bool(ERROR_RE.search(answer))
-        cited += has_cite
-        notfound += is_nf
         errors += is_err
-        flag = "ERROR" if is_err else ("not-found" if is_nf else
-                                       ("cited" if has_cite else "NO CITATION"))
+
+        if q == CONTROL:
+            # Inverted: a citation here means a source was invented for a
+            # question the corpus cannot possibly answer.
+            control_ok = bool(REFUSAL_RE.search(answer)) and not RATE_RE.search(answer)
+            flag = "control OK (refused)" if control_ok else "CONTROL FAILED"
+        else:
+            has_cite = bool(CITE_RE.search(answer))
+            is_nf = bool(NOTFOUND_RE.search(answer))
+            cited += has_cite
+            notfound += is_nf
+            flag = "ERROR" if is_err else ("not-found" if is_nf else
+                                           ("cited" if has_cite else "NO CITATION"))
         src = ""
-        m = re.search(r"📄\s*([^,:]{0,70})", answer)
+        m = re.search(r"📄\s*([^,:\n]{1,70})", answer)
         if m:
             src = " <- " + m.group(1).strip()
-        print(f"\n[{dt:5.1f}s] [{flag}]{src}\nQ: {q}\nA: {answer[:400]}")
+        via = " [escalated]" if escalated else ""
+        print(f"\n[{dt:5.1f}s] [{flag}]{via}{src}\nQ: {q}\nA: {answer[:400]}")
 
-    n = len(qs)
+    n = len(qs) - (1 if CONTROL in qs else 0)
     print("\n" + "=" * 72)
-    print(f"questions {n} | cited {cited} | not-found {notfound} | errors {errors}")
+    print(f"real questions {n} | cited {cited} | not-found {notfound} | errors {errors}")
+    if control_ok is not None:
+        print(f"control: {'refused correctly' if control_ok else 'FAILED - invented an answer'}")
+    print(f"escalated to claude: {escalations}/{len(qs)}"
+          f"  (~${escalations * COST_PER_ESCALATION:.2f} this run,"
+          f" ~${COST_PER_ESCALATION:.3f} each)")
     if times:
         print(f"time: min {min(times):.1f}s  median "
               f"{sorted(times)[len(times)//2]:.1f}s  max {max(times):.1f}s")
     if errors:
         print("\nERRORS PRESENT - the engine failed, not just the retrieval.")
+        sys.exit(1)
+    if control_ok is False:
+        print("\nCONTROL FAILED - the assistant invented an answer. Fix before shipping.")
         sys.exit(1)
 
 
