@@ -179,7 +179,13 @@ $bridgeEnv = @(
     "STANDARDS_ROOT=$Root",
     "STANDARDS_RAW=D:\LLM_FILES",
     "OLLAMA_URL=http://127.0.0.1:11434",
-    "ASK_MODEL=qwen3:4b-instruct",
+    # Measured head-to-head on the same index, escalation off: 7b answered 4/8
+    # locally against 4b's 2/8, so it escalates 5/9 instead of 7/9. Slower per
+    # answer (median 42s vs 9.5s), but 4b's speed was mostly it giving up in
+    # under 3s - and every question answered locally is one that does not
+    # spend Claude plan allowance. 7b is 4.7GB against 4GB of VRAM, so it
+    # spills into system RAM; that is the 112s worst case.
+    "ASK_MODEL=qwen2.5:7b",
     # When the local model finds nothing, cites nothing, or cites something
     # unrelated, hand the question to claude rather than telling George to
     # retype it as /pro. Costs roughly $0.076 per escalated question via the
