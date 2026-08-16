@@ -365,8 +365,25 @@ PAGE_RE = re.compile(r"\[\[page (\d+)\]\]")
 CLAUSE_RE = re.compile(r"^(\d+(?:\.\d+){1,3})[.)]?\s+(\S)")
 # A unit or another number right after the "clause number" means it is a
 # measurement continuing a sentence, not a clause: "220 кВ", "50 мкОм".
-UNIT_AFTER_RE = re.compile(r"^\s*(кВ|кв|кА|В|А|мА|мкОм|Ом|м|мм|см|мм2|°С|Гц|%|\d)",
-                           re.I)
+# A line ending in a standard's prefix means the number starting the NEXT line
+# belongs to that designation, not to the clause sequence. PDFs break
+# "ГОСТ 12.1.030" across lines constantly, and promoting the tail produced
+# "### 12.1.030 «ССБТ. Электробезопасность...»" - a heading that reads like a
+# clause and does not exist. A model then cited it, with an invented quote, for
+# a safety-critical answer.
+DESIG_TAIL_RE = re.compile(
+    r"(?:ГОСТ|СП|СНиП|СанПиН|ИСО|МЭК|ЕН|ТУ|СТО|ПУЭ|ISO|IEC|EN|DIN|ASTM)"
+    r"\s*[РR]?\s*$")
+# Case-INSENSITIVE matching here was suppressing real clauses wholesale: "м"
+# as a unit matched the "М" of "Места", "В" matched "Все", "А" matched
+# "Автоматические". Any clause whose text began with one of those letters -
+# a large share of Russian prose - never became a heading, so the document
+# lost its anchors and the model had nothing precise to cite.
+# Now case-sensitive, and a unit only counts when what follows looks like a
+# measurement (end of line, punctuation, another number) rather than prose.
+UNIT_TOKENS = r"(?:кВ|кА|мА|мкОм|Ом|мм2|мм|см|м|В|А|°С|Гц|%)"
+UNIT_AFTER_RE = re.compile(
+    r"^\s*(?:\d|" + UNIT_TOKENS + r"(?![А-Яа-яA-Za-z])\s*(?:[;,.)]|\d|$))")
 SECTION_RE = re.compile(
     r"^(Приложение|ПРИЛОЖЕНИЕ|Раздел|РАЗДЕЛ|Глава|ГЛАВА|Статья|СТАТЬЯ"
     r"|Annex|Section|Chapter|Article)\b.{0,80}$")
@@ -427,6 +444,7 @@ def to_markdown(text, title):
     text = HYPHEN_RE.sub(r"\1\2", text)
 
     out, blank, last = [f"# {title}", ""], False, None
+    prev_stripped = ""
     for raw in text.split("\n"):
         line = raw.rstrip()
         stripped = line.strip()
@@ -434,6 +452,7 @@ def to_markdown(text, title):
             if not blank:
                 out.append("")
             blank = True
+            prev_stripped = ""
             continue
         if stripped in junk:
             continue
@@ -442,9 +461,16 @@ def to_markdown(text, title):
         if SECTION_RE.match(stripped):
             out.append(f"\n## {stripped}\n")
             last = None          # numbering restarts in a new section/annex
+            prev_stripped = stripped
             continue
 
         m = CLAUSE_RE.match(stripped)
+        if m and DESIG_TAIL_RE.search(prev_stripped):
+            # "...предусмотренными ГОСТ" / "12.1.030 «ССБТ...»" - the number
+            # continues the designation on the previous line.
+            out.append(line)
+            prev_stripped = stripped
+            continue
         if m:
             num = m.group(1)
             rest = stripped[m.end(1):].lstrip(".) ")
@@ -461,8 +487,10 @@ def to_markdown(text, title):
                     head = stripped[:HEAD_MAX].rsplit(" ", 1)[0]
                     out.append(f"\n### {head}...\n")
                     out.append(line)      # full text kept, nothing truncated
+                prev_stripped = stripped
                 continue
         out.append(line)
+        prev_stripped = stripped
     md = "\n".join(out)
     return re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
 

@@ -680,6 +680,61 @@ def citation_is_relevant(question, reply):
     return bool(want & got)
 
 
+# --------------------------------------------------------- quote grounding
+
+# Verified against the text actually retrieved, in 5-word shingles, most of
+# which must be present. Exact matching is too brittle - OCR leaves stray
+# spacing and models normalise punctuation - while a whole-quote similarity
+# score would let a real opening clause carry a fabricated ending. Requiring
+# most short runs to exist means an invented phrase fails wherever it was
+# invented.
+QUOTE_SHINGLE = 5
+QUOTE_MATCH_MIN = 0.6
+
+
+def _norm_words(text):
+    return re.findall(r"[a-zа-я0-9]+", text.lower().replace("ё", "е"))
+
+
+def quotes_are_grounded(reply, chunks):
+    """Does every «quote» in the answer actually occur in what we retrieved?
+
+    The failure this exists for: asked what colour a protective earth
+    conductor is, the local model answered "синего цвета" - blue is the
+    NEUTRAL - and attributed it to a clause number that does not exist,
+    quoting a sentence that appears nowhere in the corpus. It passed the
+    citation-shape check and the vocabulary-relevance check, because the
+    fabricated quote naturally contained the question's own words.
+
+    Shape and topicality cannot catch invention. Only the source can. This is
+    a string search over text we already hold, so it is deterministic and
+    free - no model is asked to grade another model's honesty.
+    """
+    quotes = QUOTE_RE.findall(reply)
+    if not quotes:
+        return True, ""
+    hay_words = []
+    for _, ch in chunks:
+        hay_words.extend(_norm_words(ch))
+    hay = " ".join(hay_words)
+    if not hay:
+        return True, ""
+    for q in quotes:
+        qw = _norm_words(q)
+        if not qw:
+            continue
+        if len(qw) < QUOTE_SHINGLE:
+            if " ".join(qw) not in hay:
+                return False, q[:90]
+            continue
+        sh = [" ".join(qw[i:i + QUOTE_SHINGLE])
+              for i in range(len(qw) - QUOTE_SHINGLE + 1)]
+        hits = sum(1 for s in sh if s in hay)
+        if hits / float(len(sh)) < QUOTE_MATCH_MIN:
+            return False, q[:90]
+    return True, ""
+
+
 # ----------------------------------------------------------- claude escalate
 
 def find_claude():
@@ -874,6 +929,13 @@ def main():
         fallback = ("Нашёл ссылку на пункт, но он не про то, о чём вопрос — "
                     "не показываю такой ответ.\n"
                     "Спроси сильную модель: ")
+    else:
+        grounded, bad_quote = quotes_are_grounded(reply, chunks)
+        if not grounded:
+            reason = "quoted text is not in the retrieved documents: %r" % bad_quote
+            fallback = ("Ответ ссылался на цитату, которой нет в документах — "
+                        "не показываю такой ответ.\n"
+                        "Спроси сильную модель: ")
 
     if reason:
         log(f"local answer rejected: {reason}")
