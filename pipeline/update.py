@@ -495,6 +495,45 @@ def to_markdown(text, title):
     return re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
 
 
+def rebuild_markdown(m):
+    """Re-run to_markdown over every extracted document, in place.
+
+    stage_markdown only advances docs sitting at status "extracted", which is
+    correct for normal runs but means a fix to the heading logic never reaches
+    a corpus that has already been through the pipeline. Resetting statuses
+    would work, except it would also push all 56 documents back through the
+    meta stage and spend Claude allowance re-deriving titles and keywords that
+    have not changed. This regenerates full.md only, and leaves the manifest,
+    meta.json and the catalog exactly as they are.
+    """
+    changed = before = after = 0
+    for name, r in m["files"].items():
+        src = os.path.join(EXTRACTED, r["doc_id"] + ".txt")
+        out_dir = os.path.join(DOCS, r["doc_id"])
+        dst = os.path.join(out_dir, "full.md")
+        if not os.path.isfile(src) or not os.path.isdir(out_dir):
+            continue
+        with open(src, encoding="utf-8") as f:
+            text = f.read()
+        old_md = ""
+        if os.path.isfile(dst):
+            with open(dst, encoding="utf-8") as f:
+                old_md = f.read()
+        md = to_markdown(text, os.path.splitext(name)[0])
+        b = old_md.count("\n### ") + old_md.count("\n## ")
+        a = md.count("\n### ") + md.count("\n## ")
+        before += b
+        after += a
+        if md != old_md:
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write(md)
+            changed += 1
+            r["md_chars"] = len(md)
+            log(f"remd: {r['doc_id']}  headings {b} -> {a}")
+    save_manifest(m)
+    log(f"remd: {changed} document(s) rewritten; headings {before} -> {after}")
+
+
 def stage_markdown(m):
     """extracted .txt -> index/docs/<id>/full.md, with NO model involved.
 
@@ -753,6 +792,9 @@ def remove_from_index(doc_id):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--rebuild-markdown", action="store_true",
+                    help="re-run the markdown stage over the whole corpus "
+                         "(no model, no meta re-run) after a heading-logic fix")
     ap.add_argument("--scan-only", action="store_true")
     ap.add_argument("--skip-claude", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
@@ -774,6 +816,13 @@ def main():
                     "<!-- строки вида: - <id> | <название> | <ru/en> | <темы> -->\n")
 
     m = load_manifest()
+    if args.rebuild_markdown:
+        # Deliberately before the scan: this is a maintenance pass over the
+        # corpus as it already stands, not a document update.
+        rebuild_markdown(m)
+        rebuild_catalog(m)
+        return
+
     changed, removed = stage_scan(m)
     write_report(m)
     log(f"scan: {changed} new/changed, {len(removed)} removed, "
