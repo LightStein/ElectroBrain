@@ -47,6 +47,8 @@ all carried over from lessons that cost real outages in the original.
 | `gateway/` | Telegram bot + per-project bridge (named pipes on Windows) |
 | `pipeline/update.py` | Scan → extract → OCR → cleanup, manifest-driven and resumable |
 | `ops/install.ps1` | Registers the NSSM services and the `standards-heal` task |
+| `ops/correctness.py` | Asserts facts: is the answer TRUE? A WRONG verdict exits non-zero |
+| `ops/eval.py` | Retrieval/citation regression harness — does NOT judge truth |
 | `ops/ctl.ps1` | `status` / `start` / `stop` / `restart` / `heal` / `restart-when-idle` / `logs` / `ask` |
 | `ops/laptop-setup/` | One-shot SSH + Cloudflare tunnel setup for the laptop |
 | `Update-Standards.bat` | George's single button after adding or removing a document |
