@@ -8,7 +8,7 @@ Built for George, an electrical revisor who currently spends 4–5 hours hunting
 through standards for a single answer.
 
 ```
-Telegram ──► bot.js ──► bridge-server.js ──► ask.py ──► Ollama (qwen3:4b)
+Telegram ──► bot.js ──► bridge-server.js ──► ask.py ──► Ollama (qwen2.5:7b)
                                                │
                                                ├─ index/catalog.md      (which docs?)
                                                ├─ index/docs/*/full.md  (grep + rank)
