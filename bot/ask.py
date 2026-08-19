@@ -330,17 +330,25 @@ def route_lexical(question, metas, max_docs=12, expanded=None):
     for doc_id, meta in metas.items():
         ru = meta.get("keywords_ru") or []
         en = meta.get("keywords_en") or []
-        # Corpus-derived vocabulary: what the document actually talks about,
-        # as opposed to what its opening pages announce. No aligned twin, so
-        # it is matched on its own.
-        for kw in (meta.get("keywords_idf") or []):
-            if any(t.startswith(kw[:5]) or kw.startswith(t[:5]) for t in qt if len(t) > 4):
-                score += 2.0
-                hits.append(kw)
         topics = meta.get("topics") or []
         title = meta.get("title") or ""
 
         score, hits = 0.0, []
+        # Corpus-derived vocabulary: what the document actually talks about,
+        # as opposed to what its opening pages announce. No aligned twin, so
+        # it is matched on its own.
+        #
+        # This block used to sit ABOVE the initialisation on the line before.
+        # On the first document that was an UnboundLocalError - a hard crash
+        # of the whole request, surfacing to George as "Внутренняя ошибка
+        # помощника" - and on every later document it scored the PREVIOUS
+        # document instead, then discarded it, while hits.append() polluted
+        # that document's search terms after they had already been recorded.
+        # So the feature never once contributed to routing.
+        for kw in (meta.get("keywords_idf") or []):
+            if any(t.startswith(kw[:5]) or kw.startswith(t[:5]) for t in qt if len(t) > 4):
+                score += 2.0
+                hits.append(kw)
         # Keywords are the strongest signal, and the aligned pair gives us the
         # other language for free.
         for i, kw in enumerate(ru):
