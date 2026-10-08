@@ -73,6 +73,8 @@ API_MODEL = os.environ.get("ASK_API_MODEL", "claude-opus-5-5")
 API_EFFORT = os.environ.get("ASK_API_EFFORT", "high")
 API_MAX_TOKENS = int(os.environ.get("ASK_API_MAX_TOKENS", "8000"))
 API_TIMEOUT = float(os.environ.get("ASK_API_TIMEOUT", "600"))
+# Only needed for a key that is not scoped to a workspace (sk-ant-usr-...).
+API_WORKSPACE_ID = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
 ANSWER_PROMPT_FILE = os.environ.get(
     "ASK_ANSWER_PROMPT", os.path.join(SCRIPT_DIR, "answer-prompt.md"))
 # Every answer is appended here with its token usage. Nobody could previously
@@ -543,7 +545,14 @@ def answer_claude(question, ctx_chunks, history, titles_by_id):
         msgs.append({"role": "assistant", "content": h["a"][:800]})
     msgs.append({"role": "user", "content": content})
 
-    client = anthropic.Anthropic(timeout=API_TIMEOUT)
+    # A user-scoped key (sk-ant-usr-...) belongs to no single workspace, so the
+    # API requires the workspace to be named per request; a workspace-scoped
+    # key carries it already and needs nothing here.
+    headers = {}
+    if API_WORKSPACE_ID:
+        headers["anthropic-workspace-id"] = API_WORKSPACE_ID
+    client = anthropic.Anthropic(timeout=API_TIMEOUT,
+                                 default_headers=headers or None)
     kwargs = dict(model=API_MODEL, max_tokens=API_MAX_TOKENS, system=sys_prompt,
                   thinking={"type": "adaptive"},
                   output_config={"effort": API_EFFORT}, messages=msgs)

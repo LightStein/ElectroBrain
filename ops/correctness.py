@@ -32,9 +32,15 @@ import subprocess
 import sys
 import time
 
-ROOT = os.environ.get("STANDARDS_ROOT",
-                      os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ASK = os.path.join(ROOT, "bot", "ask.py")
+# Where the CODE is, and where the CORPUS is, are two different things. They
+# used to be one: STANDARDS_ROOT resolved both, which worked only because the
+# Windows laptop kept them in the same folder. Point STANDARDS_ROOT at a
+# corpus elsewhere - a server volume, a test fixture - and this resolved
+# ask.py inside the corpus and died on FileNotFoundError.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASK = os.path.join(REPO, "bot", "ask.py")
+# The corpus, overridable; inherited by ask.py through the environment.
+ROOT = os.environ.get("STANDARDS_ROOT", REPO)
 
 REFUSAL_RE = re.compile(
     r"не наш[ёе]л|не найдено|прямого ответа нет|не показываю|NOT_FOUND|"
@@ -114,7 +120,7 @@ def ask(question, timeout=900):
     t0 = time.time()
     r = subprocess.run([sys.executable, ASK, "-p", question, "--fresh"],
                        capture_output=True, text=True, encoding="utf-8",
-                       cwd=os.path.join(ROOT, "bot"), env=env, timeout=timeout)
+                       cwd=os.path.join(REPO, "bot"), env=env, timeout=timeout)
     return (r.stdout or "").strip(), (r.stderr or ""), time.time() - t0
 
 

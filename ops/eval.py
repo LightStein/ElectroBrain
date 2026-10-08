@@ -27,9 +27,15 @@ import subprocess
 import sys
 import time
 
-ROOT = os.environ.get("STANDARDS_ROOT",
-                      os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ASK = os.path.join(ROOT, "bot", "ask.py")
+# Where the CODE is, and where the CORPUS is, are two different things. They
+# used to be one: STANDARDS_ROOT resolved both, which worked only because the
+# Windows laptop kept them in the same folder. Point STANDARDS_ROOT at a
+# corpus elsewhere - a server volume, a test fixture - and this resolved
+# ask.py inside the corpus and died on FileNotFoundError.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASK = os.path.join(REPO, "bot", "ask.py")
+# The corpus, overridable; inherited by ask.py through the environment.
+ROOT = os.environ.get("STANDARDS_ROOT", REPO)
 
 # Deliberately mixed: things the corpus clearly covers, phrasings an
 # electrician would actually use (not the standards' own vocabulary), and one
@@ -74,7 +80,7 @@ def run(question, pro=False):
     t0 = time.time()
     r = subprocess.run([py, ASK, "-p", prompt, "--fresh"],
                        capture_output=True, text=True, encoding="utf-8",
-                       cwd=os.path.join(ROOT, "bot"), timeout=600)
+                       cwd=os.path.join(REPO, "bot"), timeout=600)
     # stderr carries ask.py's own log, which is the only place that says
     # whether the local model answered or claude was called. With
     # auto-escalation on, that is the difference between a free answer and a

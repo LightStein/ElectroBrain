@@ -37,6 +37,7 @@ Environment=STANDARDS_ROOT=/home/anri/LLM_setup_for_george
 Environment=PYTHONIOENCODING=utf-8
 Environment=PYTHONUTF8=1
 # Secrets (ANTHROPIC_API_KEY, and nothing else) come from a gitignored file.
+# ANTHROPIC_WORKSPACE_ID (if the key is user-scoped) also comes from here.
 EnvironmentFile=/home/anri/LLM_setup_for_george/secrets.env
 
 ExecStartPre=/bin/bash -c 'mkdir -p /home/anri/LLM_setup_for_george/run/pending && rm -f /home/anri/LLM_setup_for_george/run/electrobrain-bridge.sock'
