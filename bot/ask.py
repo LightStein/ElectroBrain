@@ -7,70 +7,100 @@ Invoked by the bridge once per turn:
 Stdout = the reply (bridge BRIDGE_OUTPUT=plain). Progress lines go to
 ./.progress (the bridge tails it and forwards lines to Telegram).
 
-Pipeline (local, qwen via Ollama):
-  A. one qwen call: question (+ short history) + catalog.md
-       -> {"terms_ru": [...], "terms_en": [...], "doc_ids": [...]}
-  B. lexical retrieval: score heading-chunks of the selected docs' full.md
+Pipeline:
+  A. lexical routing: pick candidate documents and bilingual search terms
+     from meta.json keywords - no model, no latency
+  B. retrieval: score heading-delimited chunks of those documents' full.md
      by term hits (tf * idf-lite), take the top chunks
-  C. one qwen call: answer in Russian with mandatory citations
-     (document title + clause number + verbatim quote)
+  C. ONE Claude API call: the retrieved chunks plus the question, no tools
 
-Escalation to `claude -p` (strong engine, Anri's account):
-  - message starts with "PRO:" (bot's /pro command)
-  - message contains an [Image attached:...] / [File attached:...] marker
-    (qwen is text-only)
-  - stage C reports NOT_FOUND and ASK_AUTO_ESCALATE=1
+Stage C used to be a local Ollama model with the Claude Code CLI behind it as
+an escalation. Both are gone, and the measurements are in the comments by
+API_MODEL and answer_claude(): the local model answered under half the
+questions, needed 42-112s because 7B does not fit 4GB of VRAM, and once
+inverted a safety-critical wire colour; the CLI escalation re-derived
+retrieval with grep at 195k-1.1M tokens per question for work stage B had
+already done. One stateless call with the chunks costs ~20k tokens, which is
+why the strongest model is now cheaper than the weakest setup we began with.
+
+Every answer passes four guards before George sees it (check_answer): a
+citation must be present, relevant to the question, quoting text that exists
+in the retrieved chunks, and citing a clause number that exists there too.
 
 Configuration via environment (all optional):
-  STANDARDS_ROOT     root folder (default: parent of this script's directory)
-  OLLAMA_URL         default http://127.0.0.1:11434
-  ASK_MODEL          default qwen3:4b-instruct (non-thinking)
-  ASK_NUM_CTX        default 16384
-  ASK_HISTORY_FILE   default <root>/state/ask-history.json
-  ASK_MAX_CHUNK_CHARS  total retrieval budget, default 12000
-  ASK_THINK_FINAL    "1" = let the model think (default 0; the default
-                     model has no thinking mode)
-  ASK_AUTO_ESCALATE  "1" = auto-run claude when qwen finds nothing (default 0)
-  ASK_CLAUDE_MODEL   default "haiku"
-  ASK_PRO_PROMPT     default <script dir>/pro-prompt.md
+  STANDARDS_ROOT       root folder (default: parent of this script's directory)
+  ANTHROPIC_API_KEY    required - the engine cannot answer without it
+  ASK_API_MODEL        default claude-opus-5-5
+  ASK_API_EFFORT       low|medium|high|xhigh|max, default high
+  ASK_API_MAX_TOKENS   default 8000
+  ASK_API_TIMEOUT      seconds, default 600
+  ASK_HISTORY_FILE     default <root>/state/ask-history.json
+  ASK_ANSWER_LOG       default <root>/state/answers.jsonl
+  ASK_ANSWER_PROMPT    default <script dir>/answer-prompt.md
+  ASK_MAX_CHUNK_CHARS  total retrieval budget, default 60000
+  ASK_MAX_CHUNKS       default 40
+  ASK_MAX_CHUNKS_PER_DOC  default 6
 """
 
 import argparse
+import base64
+import datetime
 import json
 import math
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
-import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("STANDARDS_ROOT", os.path.dirname(SCRIPT_DIR))
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-# qwen3:4b thinks unconditionally in Ollama - neither think=false nor
-# /no_think suppresses it - and burns ~450 tokens (~30s on a GTX 1650)
-# on a one-line question. The -instruct variant does not think at all:
-# same question, 30 tokens, 7s. Measured on the target laptop.
-MODEL = os.environ.get("ASK_MODEL", "qwen3:4b-instruct")
-NUM_CTX = int(os.environ.get("ASK_NUM_CTX", "16384"))
+# The engine is the Claude API, called ONCE per question with the chunks
+# retrieval already selected. It used to be a local Ollama model with the
+# Claude Code CLI as an escalation, and that arrangement was measured and
+# abandoned: the local model answered 3-4 of 8 questions, took 42-112s
+# because a 7B model does not fit 4GB of VRAM, and once told a revisor that
+# the protective-earth conductor is blue (it is yellow-green; blue is the
+# neutral) citing a clause that does not exist. The CLI escalation that
+# rescued those answers re-did retrieval itself with grep, costing
+# 195k-1.1M tokens per question for work ask.py had already done.
+#
+# Sending the retrieved chunks instead costs ~20k tokens, which makes the
+# most capable model cheaper than the weakest arrangement we started with.
+API_MODEL = os.environ.get("ASK_API_MODEL", "claude-opus-5-5")
+# Thinking is always on for this model and cannot be disabled; effort is the
+# only depth control and its default is "medium". George's stated priority is
+# precision over speed, so this is set explicitly rather than left to default.
+API_EFFORT = os.environ.get("ASK_API_EFFORT", "high")
+API_MAX_TOKENS = int(os.environ.get("ASK_API_MAX_TOKENS", "8000"))
+API_TIMEOUT = float(os.environ.get("ASK_API_TIMEOUT", "600"))
+ANSWER_PROMPT_FILE = os.environ.get(
+    "ASK_ANSWER_PROMPT", os.path.join(SCRIPT_DIR, "answer-prompt.md"))
+# Every answer is appended here with its token usage. Nobody could previously
+# see what George had been told - the one person able to check an answer had
+# no way to read any, which is the gap that let a wrong answer go unnoticed.
+ANSWER_LOG = os.environ.get("ASK_ANSWER_LOG",
+                            os.path.join(ROOT, "state", "answers.jsonl"))
+# $/MTok (input, cache-read, output), for the cost estimate in the log only.
+PRICES = {
+    "claude-opus-5-5":   (4.0, 0.20, 20.0),
+    "claude-opus-5":     (5.0, 0.25, 25.0),
+    "claude-sonnet-5-5": (2.0, 0.20, 10.0),
+    "claude-haiku-4-5":  (1.0, 0.10, 5.0),
+}
+
 HISTORY_FILE = os.environ.get("ASK_HISTORY_FILE", os.path.join(ROOT, "state", "ask-history.json"))
-# At the measured ~114 tok/s prompt processing, 12000 chars of context was
-# ~5000 tokens = ~44s of prompt processing before generation even begins.
-# 6000 keeps the answer call inside a usable chat latency.
-# Measured, not assumed: 14000 scored WORSE than 6000 on the same question
-# set (2 cited vs 3, and one answer lost its citation entirely). A 4B model
-# does not use a bigger haystack well - the answer gets diluted rather than
-# found. More context is not free accuracy.
-MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "6000"))
-# Per-chunk size. At 2500 the 6000-char budget fit only TWO chunks, so a
-# single document could take both slots and crowd out the one that actually
-# held the answer - observed with a switch-height question where СП 256 was
-# correctly shortlisted but never made it into the context. Smaller chunks
-# mean more documents represented for the same number of tokens.
+# The old 6000-char ceiling was a measured property of a 4B model, not of the
+# task: at 14000 it scored WORSE, because a small model dilutes rather than
+# finds. That ceiling does not apply to the model answering now, and the
+# system was losing to recall - every answer was drawn from 0.04% of a 15.2MB
+# corpus. ~60k chars is ~20k tokens, roughly $0.10 a question on Opus 5.5.
+MAX_CHUNK_CHARS = int(os.environ.get("ASK_MAX_CHUNK_CHARS", "60000"))
+# Per-chunk size. At 2500 the budget fit only TWO chunks, so a single
+# document could take both slots and crowd out the one that actually held the
+# answer - observed with a switch-height question where СП 256 was correctly
+# shortlisted but never made it into the context.
 CHUNK_CHARS = int(os.environ.get("ASK_CHUNK_CHARS", "1200"))
-MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "2"))
+MAX_CHUNKS_PER_DOC = int(os.environ.get("ASK_MAX_CHUNKS_PER_DOC", "6"))
 # The question's own words matter far more than keywords expanded from
 # meta.json; weighting them equally is what let reference lists outrank real
 # clauses.
@@ -81,26 +111,10 @@ EXPANDED_TERM_WEIGHT = 1.0
 # the right ones.
 DESIGNATION_WEIGHT = 8.0
 EXPANDED_QUERY_WEIGHT = 2.0
-MAX_CHUNKS = int(os.environ.get("ASK_MAX_CHUNKS", "8"))
+MAX_CHUNKS = int(os.environ.get("ASK_MAX_CHUNKS", "40"))
 # A chunk that is mostly "ГОСТ Р 55842-2013 (ИСО 30061:2007) ..." is a
 # normative-references list. It matches many terms and answers nothing.
 REFLIST_RE = re.compile(r"(ГОСТ|МЭК|ИСО|IEC|ISO|СП|СНиП|EN)\s*[Р\s]*[\d.\-]{3,}", re.I)
-# Off by default: the default model has no thinking mode to enable.
-THINK_FINAL = os.environ.get("ASK_THINK_FINAL", "0") == "1"
-AUTO_ESCALATE = os.environ.get("ASK_AUTO_ESCALATE", "0") == "1"
-# "lexical" (default) routes without a model - see stage A. "llm" keeps the
-# original catalog-in-prompt router, retained for comparison.
-ROUTER = os.environ.get("ASK_ROUTER", "lexical")
-# Measured three ways on the same nine questions:
-#   6k context, no expansion : 3 cited, 6 not-found, 0 uncited, median 22s
-#   14k + expansion          : 2 cited, 6 not-found, 1 uncited, median 82s
-#   6k + expansion           : 3 cited, 5 not-found, 1 uncited, median 48s
-# Expansion buys no extra citations, doubles latency, and produced an
-# UNCITED answer - the one failure a revisor cannot absorb. Off by default;
-# ASK_EXPAND=1 to re-test if the corpus or model changes.
-EXPAND_QUERY = os.environ.get("ASK_EXPAND", "0") == "1"
-CLAUDE_MODEL = os.environ.get("ASK_CLAUDE_MODEL", "haiku")
-PRO_PROMPT_FILE = os.environ.get("ASK_PRO_PROMPT", os.path.join(SCRIPT_DIR, "pro-prompt.md"))
 
 # A source line: the 📄 marker, or an explicit clause reference.
 CITATION_RE = re.compile(r"📄|\bп\.\s*\d|\bпункт\s*\d", re.I)
@@ -142,83 +156,6 @@ def save_history(history):
     except OSError:
         pass
 
-
-def ollama_chat(messages, think, want_json=False, timeout=300):
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "stream": False,
-        "think": think,
-        "options": {"num_ctx": NUM_CTX, "temperature": 0.2},
-    }
-    if want_json:
-        payload["format"] = "json"
-    req = urllib.request.Request(
-        OLLAMA_URL + "/api/chat",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:  # older ollama may reject "think" — retry without it
-        if "think" in payload:
-            payload.pop("think")
-            req = urllib.request.Request(
-                OLLAMA_URL + "/api/chat",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read())
-        else:
-            raise e
-    content = (data.get("message") or {}).get("content", "")
-    # Strip any inline <think> block qwen may emit when `think` isn't honored.
-    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-    return content
-
-
-
-
-# ------------------------------------------------ stage A2: query expansion
-#
-# The measured failure mode is synonymy, not inflection: "газовой трубы" vs
-# "газопроводов", "розеточная группа" vs "штепсельные розетки". No stemmer
-# bridges those - they are different words for the same thing, and standards
-# use the formal register while people ask in the colloquial one.
-#
-# So spend a model call turning the question into the vocabulary the
-# DOCUMENTS use. This costs ~15s, which is the right trade when precision
-# matters more than speed.
-
-EXPAND_SYSTEM = """Ты помогаешь искать по русским нормативным документам \
-(электроустановки, пожарная безопасность, заземление, молниезащита).
-
-Дан вопрос обычными словами. Верни СТРОГО JSON без пояснений:
-{"terms": ["...", "..."]}
-
-15-25 слов и коротких словосочетаний, которые РЕАЛЬНО встречаются в тексте \
-нормативных документов по этой теме. Обязательно включи:
-- официальные термины вместо разговорных: "газовая труба" -> "газопровод", \
-"розетка" -> "штепсельная розетка", "провод" -> "проводник"
-- однокоренные и родственные слова
-- аббревиатуры и обозначения: УЗО, ПУЭ, ГОСТ, IP, TN-C, PE, N
-- английские эквиваленты, если документ может быть на английском
-Только термины, без объяснений."""
-
-
-def expand_query(question):
-    """Ask the model for the vocabulary the documents actually use."""
-    msgs = [{"role": "system", "content": EXPAND_SYSTEM},
-            {"role": "user", "content": question}]
-    try:
-        raw = ollama_chat(msgs, think=False, want_json=True, timeout=180)
-        terms = json.loads(raw).get("terms") or []
-        return [t for t in terms if isinstance(t, str) and 2 < len(t) < 60]
-    except (ValueError, OSError) as e:
-        log(f"expand failed ({e}); continuing without expansion")
-        return []
 
 # ------------------------------------------------- stage A: lexical routing
 #
@@ -386,82 +323,6 @@ def route_lexical(question, metas, max_docs=12, expanded=None):
     # answering "not found" from an empty shortlist.
     return terms, doc_ids
 
-# ------------------------------------------- stage A (legacy): LLM routing
-
-ROUTE_SYSTEM = """Ты — маршрутизатор вопросов к каталогу нормативных документов \
-(электрика, пожарные системы, заземление, молниезащита и т.п.). Документы на \
-русском и английском. Тебе дан каталог (id | название | язык | темы) и вопрос.
-
-Верни СТРОГО JSON без пояснений:
-{"terms_ru": [...], "terms_en": [...], "doc_ids": [...]}
-
-- terms_ru: 3-8 ключевых слов/словосочетаний ПО-РУССКИ для поиска по тексту
-  (включая синонимы: например для "цвет провода заземления" — "заземление",
-  "защитный проводник", "жёлто-зелёный", "PE", "маркировка").
-- terms_en: те же понятия ПО-АНГЛИЙСКИ ("grounding", "protective earth",
-  "green-yellow", "conductor colour").
-- doc_ids: id ВСЕХ документов из каталога, которые могут содержать ответ
-  (обычно 3-15). Если не уверен — включай."""
-
-
-# Router prompt budget in CHARACTERS. num_ctx counts prompt AND response, so
-# reserve room for the system prompt, history, question and the JSON reply,
-# then convert with a deliberately pessimistic 2.5 chars/token - Russian
-# tokenises worse than English, and over-estimating here only costs some
-# keyword detail, while under-estimating silently truncates the prompt.
-CATALOG_BUDGET = int(os.environ.get("ASK_CATALOG_BUDGET",
-                                    str(int((NUM_CTX - 1500) * 2.5))))
-
-
-def shrink_catalog(catalog_text):
-    """Keep every document, drop detail, when the catalog outgrows the window.
-
-    Truncating the prompt would silently drop whole documents off the end -
-    they become unroutable and nobody finds out. Shortening each line instead
-    costs some keyword recall but keeps every document reachable.
-    """
-    if len(catalog_text) <= CATALOG_BUDGET:
-        return catalog_text
-    out = []
-    for line in catalog_text.split("\n"):
-        if line.startswith("- "):
-            parts = line.split("|")
-            if len(parts) >= 4:
-                topics = ", ".join(parts[3].split(",")[:3]).strip()
-                line = f"{parts[0].strip()} | {parts[1].strip()} | {topics}"
-        out.append(line)
-    shrunk = "\n".join(out)
-    log(f"catalog {len(catalog_text)} chars > budget {CATALOG_BUDGET}, "
-        f"shortened to {len(shrunk)}")
-    if len(shrunk) > CATALOG_BUDGET:
-        log("WARNING: catalog still over budget - the router may not see "
-            "every document. Trim topics in meta.json or raise ASK_NUM_CTX.")
-    return shrunk
-
-
-def route(question, catalog_text, history):
-    catalog_text = shrink_catalog(catalog_text)
-    hist = ""
-    if history:
-        last = history[-2:]
-        hist = "\n\nКонтекст предыдущих вопросов:\n" + "\n".join(
-            f"Q: {h['q'][:200]}" for h in last)
-    msgs = [
-        {"role": "system", "content": ROUTE_SYSTEM},
-        {"role": "user", "content": f"КАТАЛОГ:\n{catalog_text}\n{hist}\n\nВОПРОС: {question}"},
-    ]
-    raw = ollama_chat(msgs, think=False, want_json=True, timeout=180)
-    try:
-        parsed = json.loads(raw)
-        terms = [t for t in (parsed.get("terms_ru") or []) + (parsed.get("terms_en") or [])
-                 if isinstance(t, str) and t.strip()]
-        doc_ids = [d for d in (parsed.get("doc_ids") or []) if isinstance(d, str)]
-        return terms, doc_ids
-    except ValueError:
-        log(f"route: unparseable JSON: {raw[:200]}")
-        return [w for w in re.findall(r"\w{4,}", question)][:8], []
-
-
 # -------------------------------------------------------- stage B: retrieval
 
 HEADING_RE = re.compile(r"^#{1,4}\s", re.M)
@@ -615,31 +476,133 @@ def retrieve(doc_ids, terms):
 
 # --------------------------------------------------------- stage C: answer
 
-ANSWER_SYSTEM = """Ты — помощник ревизора по электротехническим и пожарным \
-нормам. Отвечай ТОЛЬКО на основе приведённых фрагментов документов. Правила:
-
-1. Отвечай по-русски, кратко и по делу (это Telegram).
-2. ОБЯЗАТЕЛЬНО указывай источник: название документа и номер пункта/раздела,
-   плюс короткую дословную цитату. Формат в конце ответа:
-   📄 <документ>, п. <пункт>: «<цитата>»
-3. Если во фрагментах ответа НЕТ — не выдумывай. Напиши ровно: NOT_FOUND
-4. Если фрагменты противоречат друг другу — покажи оба варианта с источниками.
-5. Заверши строкой: _Проверь в первоисточнике._"""
-
-
-def answer(question, ctx_chunks, history, titles_by_id):
+def build_context(ctx_chunks, titles_by_id):
     parts = []
     for did, ch in ctx_chunks:
         title = titles_by_id.get(did, did)
-        parts.append(f"===== {title} (id: {did}) =====\n{ch}")
-    context = "\n\n".join(parts)
-    msgs = [{"role": "system", "content": ANSWER_SYSTEM}]
+        parts.append("===== %s (id: %s) =====\n%s" % (title, did, ch))
+    return "\n\n".join(parts)
+
+
+def _image_blocks(question):
+    """Telegram photos arrive as a '[Image attached: <path>]' marker."""
+    blocks = []
+    for path in re.findall(r"\[Image attached:\s*([^\]]+?)\]", question):
+        path = path.strip()
+        ext = os.path.splitext(path)[1].lower()
+        media = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".gif": "image/gif", ".webp": "image/webp"}.get(ext)
+        if not media or not os.path.isfile(path):
+            log("image skipped (unsupported or missing): %s" % path)
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode("ascii")
+        except OSError as e:
+            log("image unreadable: %s" % e)
+            continue
+        blocks.append({"type": "image",
+                       "source": {"type": "base64", "media_type": media, "data": data}})
+    return blocks
+
+
+def answer_claude(question, ctx_chunks, history, titles_by_id):
+    """One stateless call: the chunks we already found, and the question.
+
+    The predecessor to this function told the model to find the documents
+    itself with grep, which cost 195k-1.1M input tokens per question - for
+    retrieval stage B had already done and then discarded. Passing the chunks
+    instead is ~20k tokens, so the strongest model now costs less than the
+    weakest arrangement did.
+
+    No tools are given deliberately. Without them there is no agentic loop,
+    so there is no turn-count variance, nothing to cap with --max-turns (which
+    returned an empty answer on 1 of 2 test questions), and no path by which
+    text typed into a Telegram chat can reach a shell.
+    """
+    import anthropic
+
+    try:
+        with open(ANSWER_PROMPT_FILE, encoding="utf-8") as f:
+            sys_prompt = f.read().strip()
+    except OSError:
+        sys_prompt = ("Отвечай по-русски, только по приведённым фрагментам "
+                      "стандартов, всегда указывай документ, пункт и точную "
+                      "цитату. Если ответа во фрагментах нет - скажи прямо.")
+
+    content = []
+    content.extend(_image_blocks(question))
+    clean_q = re.sub(r"\[(?:Image|File) attached:[^\]]*\]", "", question).strip()
+    content.append({"type": "text",
+                    "text": "ФРАГМЕНТЫ ДОКУМЕНТОВ:\n%s\n\nВОПРОС: %s"
+                            % (build_context(ctx_chunks, titles_by_id), clean_q)})
+
+    msgs = []
     for h in history[-3:]:
         msgs.append({"role": "user", "content": h["q"]})
         msgs.append({"role": "assistant", "content": h["a"][:800]})
-    msgs.append({"role": "user",
-                 "content": f"ФРАГМЕНТЫ ДОКУМЕНТОВ:\n{context}\n\nВОПРОС: {question}"})
-    return ollama_chat(msgs, think=THINK_FINAL, timeout=420)
+    msgs.append({"role": "user", "content": content})
+
+    client = anthropic.Anthropic(timeout=API_TIMEOUT)
+    kwargs = dict(model=API_MODEL, max_tokens=API_MAX_TOKENS, system=sys_prompt,
+                  thinking={"type": "adaptive"},
+                  output_config={"effort": API_EFFORT}, messages=msgs)
+    try:
+        # Server-side fallback: if a safety classifier declines, the API reruns
+        # the request on another model within the same call instead of handing
+        # George an error. Unlikely on published electrical standards, but the
+        # failure it prevents is silent.
+        resp = client.beta.messages.create(
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs)
+    except anthropic.BadRequestError as e:
+        # If the beta is ever withdrawn, answering still matters more than the
+        # fallback does.
+        log("fallback beta rejected (%s); retrying without it" % str(e)[:120])
+        resp = client.messages.create(**kwargs)
+
+    if resp.stop_reason == "refusal":
+        cat = getattr(resp.stop_details, "category", None) if resp.stop_details else None
+        log("refused by safety classifier: %s" % cat)
+        return ("Модель отказалась отвечать на этот вопрос. "
+                "Переформулируй или напиши Анри."), resp.usage
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    if resp.stop_reason == "max_tokens":
+        log("answer truncated at max_tokens")
+    return text, resp.usage
+
+
+def usage_cost(usage):
+    """Estimated $ for one call. For the log - not a billing record."""
+    rates = PRICES.get(API_MODEL)
+    if not rates or usage is None:
+        return None
+    inp, cached, out = rates
+    g = lambda n: getattr(usage, n, 0) or 0
+    return round((g("input_tokens") * inp
+                  + g("cache_read_input_tokens") * cached
+                  + g("cache_creation_input_tokens") * inp * 1.25
+                  + g("output_tokens") * out) / 1e6, 5)
+
+
+def log_answer(question, reply, usage, doc_ids, verdict):
+    """Append-only record so a wrong answer can be found after the fact."""
+    g = lambda n: (getattr(usage, n, 0) or 0) if usage else 0
+    row = {
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "model": API_MODEL, "effort": API_EFFORT,
+        "question": question[:500], "answer": reply[:4000],
+        "docs": list(doc_ids)[:12], "verdict": verdict,
+        "in_tokens": g("input_tokens") + g("cache_read_input_tokens")
+                     + g("cache_creation_input_tokens"),
+        "out_tokens": g("output_tokens"), "est_usd": usage_cost(usage),
+    }
+    try:
+        os.makedirs(os.path.dirname(ANSWER_LOG), exist_ok=True)
+        with open(ANSWER_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log("answer log failed: %s" % e)
+
 
 
 # -------------------------------------------------------- citation relevance
@@ -743,91 +706,39 @@ def quotes_are_grounded(reply, chunks):
     return True, ""
 
 
-# ----------------------------------------------------------- claude escalate
+# ------------------------------------------------------- clause verification
 
-def find_claude():
-    """Absolute path to a claude CLI that subprocess can launch cleanly.
+# Any dotted clause-like number occurring in the text we retrieved.
+CLAUSE_PRESENT_RE = re.compile(r"\b\d+(?:\.\d+){1,3}\b")
+# A clause the answer claims to cite. Only dotted forms are checked: a bare
+# "п. 7" cannot be told apart from an ordinary number in the source text, and
+# a guard that fires on ambiguity gets switched off.
+CLAUSE_CITED_RE = re.compile(r"(?:п\.|пункт|§)\s*(\d+(?:\.\d+){1,3})", re.I)
 
-    npm lays down three shims next to each other - `claude` (a bash script
-    with no extension), `claude.cmd` and `claude.ps1` - plus the real
-    binary at node_modules/@anthropic-ai/claude-code/bin/claude.exe.
 
-    Two traps, both hit on this project:
-      * a bare which("claude") returns the extensionless bash shim, which
-        Windows cannot execute at all (FileNotFoundError, indistinguishable
-        from "claude is not installed");
-      * the .cmd shim re-parses its arguments through cmd.exe, which mangles
-        a multi-line --append-system-prompt into nothing, so claude exits
-        with "Input must be provided ... when using --print".
+def cited_clauses_exist(reply, chunks):
+    """Does every clause number the answer cites appear in the source?
 
-    So prefer the real .exe, which CreateProcess launches with argv intact.
+    Quote grounding checks the TEXT of a citation. It cannot catch a real
+    quote from one clause labelled with another clause's number - shape,
+    vocabulary and grounding all pass, and the result is a verbatim quote
+    under a number that does not say it. For an inspector copying a reference
+    into a certification document that is worse than an obviously absurd
+    answer, because nothing about it looks wrong.
 
-    Third trap, and the one that actually shipped broken: every path below is
-    discovered relative to the CURRENT user. The bridge runs as a Windows
-    service under LocalSystem, whose %APPDATA% is not George's, so all of this
-    found nothing and escalation failed with "claude CLI not found" - while
-    the same code worked perfectly from an interactive shell, which is where
-    it had been tested. ASK_CLAUDE_BIN pins the absolute path at install time
-    so service context cannot change the answer.
+    The number that started this work, 12.1.030, was never a clause at all:
+    it was "ГОСТ 12.1.030" broken across lines by the PDF and promoted to a
+    heading by the pipeline. The pipeline no longer does that, and this
+    refuses to cite such a number even if one reappears.
     """
-    pinned = os.environ.get("ASK_CLAUDE_BIN", "").strip()
-    if pinned:
-        if os.path.isfile(pinned):
-            return pinned
-        log(f"ASK_CLAUDE_BIN set but not a file: {pinned}")
-    if os.name == "nt":
-        for base in (os.environ.get("APPDATA", ""),
-                     os.environ.get("ProgramFiles", "")):
-            if not base:
-                continue
-            cand = os.path.join(base, "npm", "node_modules", "@anthropic-ai",
-                                "claude-code", "bin", "claude.exe")
-            if os.path.isfile(cand):
-                return cand
-        # Fall back to a shim, .cmd only - never the bash or .ps1 one.
-        for name in ("claude.exe", "claude.cmd"):
-            p = shutil.which(name)
-            if p and p.lower().endswith((".exe", ".cmd")):
-                return p
-        return None
-    return shutil.which("claude")
+    present = set()
+    for _, ch in chunks:
+        present.update(CLAUSE_PRESENT_RE.findall(ch))
+    for num in CLAUSE_CITED_RE.findall(reply):
+        if num not in present:
+            return False, num
+    return True, ""
 
-
-def escalate_claude(question, history):
-    """Strong engine: claude CLI with grep/read over the same index."""
-    progress("⚡ Подключаю сильную модель…")
-    try:
-        with open(PRO_PROMPT_FILE, encoding="utf-8") as f:
-            sys_prompt = f.read().strip()
-    except OSError:
-        sys_prompt = ("Answer questions about electrical/fire standards using the "
-                      "Markdown index under index/. Always cite document + clause. "
-                      "Answer in Russian.")
-    hist = ""
-    if history:
-        hist = "Контекст диалога:\n" + "\n".join(
-            f"Q: {h['q'][:300]}\nA: {h['a'][:300]}" for h in history[-2:]) + "\n\n"
-    exe = find_claude()
-    if not exe:
-        return "Сильная модель недоступна: claude CLI не найден."
-    cmd = [
-        exe, "--print", "--dangerously-skip-permissions",
-        "--model", CLAUDE_MODEL,
-        "--append-system-prompt", sys_prompt,
-        "-p", hist + question,
-    ]
-    try:
-        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
-                           encoding="utf-8", timeout=600,
-                           shell=False)
-        out = (r.stdout or "").strip()
-        if r.returncode != 0 or not out:
-            return f"Ошибка сильной модели (код {r.returncode}): {(r.stderr or '')[:300]}"
-        return out
-    except FileNotFoundError:
-        return "Сильная модель недоступна: claude CLI не найден."
-    except subprocess.TimeoutExpired:
-        return "Сильная модель не ответила за 10 минут — попробуй ещё раз."
 
 
 # ------------------------------------------------------------------- main
@@ -847,6 +758,55 @@ def load_catalog():
     return text, titles
 
 
+def check_answer(question, reply, chunks):
+    """All four guards, in one place. Returns (reason, message_for_george).
+
+    These used to run only on the local model's answers and not at all on the
+    escalated ones - which, at 5-6 escalations per 9 questions, meant most of
+    what George read passed through no check whatsoever. The guards protected
+    the path that was distrusted and skipped the path that was relied on.
+    There is one path now, and everything on it is checked.
+    """
+    if "NOT_FOUND" in reply:
+        return ("model found nothing usable in the retrieved fragments",
+                "В найденных фрагментах прямого ответа нет. Попробуй "
+                "переформулировать — или, если документа в базе нет, добавь его.")
+    if not CITATION_RE.search(reply):
+        return ("no citation in the answer",
+                "Нашёл похожий текст, но не смог указать точный пункт "
+                "документа — не показываю такой ответ.")
+    if not citation_is_relevant(question, reply):
+        return ("cited clause shares no vocabulary with the question",
+                "Нашёл ссылку на пункт, но он не про то, о чём вопрос — "
+                "не показываю такой ответ.")
+    grounded, bad_quote = quotes_are_grounded(reply, chunks)
+    if not grounded:
+        return ("quoted text is not in the retrieved documents: %r" % bad_quote,
+                "Ответ ссылался на цитату, которой нет в документах — "
+                "не показываю такой ответ.")
+    ok, bad_num = cited_clauses_exist(reply, chunks)
+    if not ok:
+        return ("cited clause %s does not appear in the retrieved documents" % bad_num,
+                "Ответ ссылался на пункт %s, которого нет в найденных "
+                "документах — не показываю такой ответ." % bad_num)
+    return None, None
+
+
+def found_sources(chunks, titles):
+    """What we actually retrieved, so a refusal still points somewhere."""
+    seen, out = set(), []
+    for did, ch in chunks:
+        if did in seen:
+            continue
+        seen.add(did)
+        m = re.search(r"^###\s*(\d+(?:\.\d+){1,3})", ch, re.M)
+        where = (", п. " + m.group(1)) if m else ""
+        out.append("• %s%s" % (titles.get(did, did)[:70], where))
+        if len(out) >= 5:
+            break
+    return "\n".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--prompt", required=True)
@@ -859,16 +819,11 @@ def main():
     if args.fresh:
         save_history([])
 
-    force_pro = bool(re.match(r"^(\[From:[^\]]*\]\s*)?(\[Replying[^\]]*\]\s*)*PRO:", question))
-    has_file = "[Image attached:" in question or "[File attached:" in question
-
-    if force_pro or has_file:
-        q = re.sub(r"PRO:\s*", "", question, count=1) if force_pro else question
-        reply = escalate_claude(q, history)
-        print(reply)
-        history.append({"q": q, "a": reply})
-        save_history(history)
-        return
+    # "/pro" used to switch engines. There is only one engine now, so the
+    # prefix is accepted and ignored rather than failing in George's face.
+    question = re.sub(r"^(\[From:[^\]]*\]\s*)?(\[Replying[^\]]*\]\s*)*PRO:\s*",
+                      lambda m: m.group(0).replace("PRO:", "").rstrip(),
+                      question, count=1)
 
     catalog_text, titles = load_catalog()
     if not catalog_text:
@@ -876,16 +831,10 @@ def main():
               "Запусти Update-Standards или обратись к Анри.")
         return
 
-    if ROUTER == "llm":
-        terms, doc_ids = route(question, catalog_text, history)
-    else:
-        expanded = expand_query(question) if EXPAND_QUERY else []
-        if expanded:
-            log(f"expanded: {expanded[:12]}")
-            progress("🔎 Ищу синонимы…")
-        terms, doc_ids = route_lexical(question, load_meta_index(), expanded=expanded)
-    # Small models occasionally hallucinate ids — keep only real ones. An empty
-    # list makes retrieve() scan the whole corpus, which is the safe fallback.
+    terms, doc_ids = route_lexical(question, load_meta_index())
+    # The router works from model-written keywords and can name an id that no
+    # longer exists; an empty list makes retrieve() scan everything, which is
+    # the safe fallback.
     doc_ids = [d for d in doc_ids if d in titles]
     log(f"route {time.time()-t0:.1f}s: terms={terms} docs={doc_ids}")
     if doc_ids:
@@ -895,66 +844,48 @@ def main():
 
     chunks = retrieve(doc_ids, terms)
     log(f"retrieve {time.time()-t0:.1f}s: {len(chunks)} chunks")
-
     if not chunks:
-        if AUTO_ESCALATE:
-            reply = escalate_claude(question, history)
-        else:
-            reply = ("По этим словам ничего не нашёл в документах. "
-                     "Попробуй переформулировать или спроси сильную модель: "
-                     "/pro " + question[:150])
+        reply = ("По этим словам ничего не нашёл в документах. Попробуй "
+                 "переформулировать — например «розетка» вместо «штепсель».")
         print(reply)
+        log_answer(question, reply, None, doc_ids, "no-chunks")
         history.append({"q": question, "a": reply})
         save_history(history)
         return
 
-    reply = answer(question, chunks, history, titles)
+    progress("🧠 Читаю найденные пункты…")
+    try:
+        reply, usage = answer_claude(question, chunks, history, titles)
+    except Exception as e:
+        # Network down, key missing, service error - all look the same to
+        # George, so say the one thing he can act on. There is no local model
+        # behind this any more: no connection means no answer, which is the
+        # honest outcome rather than a weak guess.
+        name = type(e).__name__
+        log(f"api call failed: {name}: {e}")
+        reply = ("Не удалось связаться с сервером Claude. Проверь, что "
+                 "ноутбук в сети, и попробуй ещё раз. Если повторяется — "
+                 "напиши Анри.")
+        print(reply)
+        log_answer(question, reply, None, doc_ids, "api-error:" + name)
+        return
     log(f"answer {time.time()-t0:.1f}s")
 
-    # Enforce the citation contract in CODE, not just in the prompt. An answer
-    # without a source - or with one that does not match the question - is the
-    # dangerous failure here: it reads as authoritative and gives a revisor
-    # something specific to act on. Observed twice in testing, so the prompt
-    # alone is not sufficient.
-    #
-    # All three rejections converge on one decision below. They used to be
-    # separate branches, and the citation branch overwrote `reply` before the
-    # NOT_FOUND branch tested it - so with AUTO_ESCALATE on, a missing or
-    # mis-matched citation silently dead-ended instead of escalating, covering
-    # two of the three failure modes rather than three.
-    reason, fallback = None, None
-    if "NOT_FOUND" in reply:
-        reason = "qwen found nothing usable in the retrieved fragments"
-        fallback = ("В найденных фрагментах прямого ответа нет. "
-                    "Попробуй переформулировать или спроси сильную модель: ")
-    elif not CITATION_RE.search(reply):
-        reason = "no citation in the answer"
-        fallback = ("Нашёл похожий текст, но не смог указать точный пункт "
-                    "документа — не показываю такой ответ.\n"
-                    "Спроси сильную модель: ")
-    elif not citation_is_relevant(question, reply):
-        reason = "cited clause shares no vocabulary with the question"
-        fallback = ("Нашёл ссылку на пункт, но он не про то, о чём вопрос — "
-                    "не показываю такой ответ.\n"
-                    "Спроси сильную модель: ")
-    else:
-        grounded, bad_quote = quotes_are_grounded(reply, chunks)
-        if not grounded:
-            reason = "quoted text is not in the retrieved documents: %r" % bad_quote
-            fallback = ("Ответ ссылался на цитату, которой нет в документах — "
-                        "не показываю такой ответ.\n"
-                        "Спроси сильную модель: ")
-
+    reason, message = check_answer(question, reply, chunks)
     if reason:
-        log(f"local answer rejected: {reason}")
-        if AUTO_ESCALATE:
-            reply = escalate_claude(question, history)
-        else:
-            reply = fallback + "/pro " + question[:150]
+        log(f"answer rejected: {reason}")
+        sources = found_sources(chunks, titles)
+        reply = message
+        if sources:
+            # A rejection that names where to look is still useful; a bare
+            # "no" sends him back to the 4-5 hours this is meant to replace.
+            reply += "\n\nСмотрел здесь — проверь сам:\n" + sources
+    log_answer(question, reply, usage, doc_ids, reason or "ok")
 
     print(reply)
     history.append({"q": question, "a": reply})
     save_history(history)
+
 
 
 if __name__ == "__main__":
