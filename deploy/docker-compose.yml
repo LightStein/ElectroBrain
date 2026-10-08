@@ -1,0 +1,56 @@
+# ElectroBrain's own bot process. Deliberately NOT a 19th entry in
+# seiv/dev_bot's registry.json: that bot polls a single token (the production
+# laamarie_web_dev_bot), and adding a project there means recreating the
+# container. Outbound replies survive that, but INBOUND Telegram updates are
+# not persisted, so the ~10s recreate can lose messages for all 26 live
+# chats. George has his own bot token already, one poller per token is a
+# Telegram constraint, so a second process is both required and free of that
+# cost. `opxcel-telegram-bot` is the same pattern, already in production.
+#
+# What is reused rather than rebuilt: the bot image, the bot<->bridge NDJSON
+# protocol, the durable pending sweeper, the upload host-path handoff, and the
+# self-hosted Bot API server's 2GB file limit. Nothing in seiv/dev_bot is
+# modified by this file.
+
+services:
+  electrobrain-bot:
+    container_name: electrobrain-telegram-bot
+    # Built by the dev_bot compose project. Referenced, not rebuilt, so fixes
+    # there (e.g. the 0644 chmod on downloads) arrive on our next restart.
+    image: dev_bot-telegram-bot
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+      - REGISTRY_PATH=/app/registry.json
+      # Our own registry: George's chat ids and upload mapping do not belong in
+      # a file 26 other projects edit.
+      - SOCKET_PATH=/run/claude-bridge/electrobrain-bridge.sock
+      # Route file downloads through the shared self-hosted Bot API server:
+      # 2GB instead of the cloud's 20MB, which standards PDFs need.
+      - TELEGRAM_BASE_API_URL=http://telegram-bot-api:8081
+      - TELEGRAM_LOCAL_FILES=1
+    volumes:
+      # The bridge runs on the host (it needs the corpus); its socket and the
+      # pending directory live here and are mounted in so the bot can reach
+      # both. Same shape as dev_bot's run/ mount.
+      - /home/anri/LLM_setup_for_george/run:/run/claude-bridge
+      - /home/anri/LLM_setup_for_george/deploy/registry.json:/app/registry.json:ro
+      # Telegram uploads land here (container path); the bot passes the HOST
+      # path into the prompt, which the bridge opens directly.
+      - /home/anri/LLM_setup_for_george/uploads:/app/uploads
+      # Read-only so getFile's absolute paths resolve in --local mode.
+      - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+    networks:
+      - dev_bot_default
+    restart: unless-stopped
+
+networks:
+  # The Bot API server lives in the dev_bot compose project; join its network
+  # rather than duplicating the server.
+  dev_bot_default:
+    external: true
+
+volumes:
+  telegram-bot-api-data:
+    external: true
+    name: dev_bot_telegram-bot-api-data

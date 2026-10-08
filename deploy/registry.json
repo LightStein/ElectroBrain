@@ -1,0 +1,16 @@
+{
+ "_comment": "ElectroBrain only. Separate from seiv/dev_bot/registry.json on purpose.",
+ "projects": [
+  {
+   "name": "electrobrain",
+   "chatId": -1004409367303,
+   "socket": "/run/claude-bridge/electrobrain-bridge.sock",
+   "_staging_note": "true = queue uploads until the next text message, so \"here are 3 PDFs\" + \"index these\" arrives as one turn",
+   "staging": true,
+   "upload": {
+    "container": "/app/uploads",
+    "host": "/home/anri/LLM_setup_for_george/uploads"
+   }
+  }
+ ]
+}

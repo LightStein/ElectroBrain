@@ -1,0 +1,48 @@
+# ElectroBrain answering bridge. A systemd unit rather than a container
+# because it needs direct host access to the corpus and index, and its socket
+# must sit in the directory the bot container mounts; containerising it would
+# mean mounting the corpus twice for no gain.
+#
+# Unlike the 26 bridges in seiv/dev_bot, this one spawns no Claude CLI and
+# holds no session: BRIDGE_SPAWN points it at ask.py, which makes exactly one
+# stateless API call per question. Nothing here needs --continue, /compact or
+# stream-json parsing, which is why generalising their bridge-server.js was
+# never necessary - ours is already engine-agnostic.
+[Unit]
+Description=ElectroBrain Answering Bridge (standards assistant for George)
+After=network.target
+
+[Service]
+Type=simple
+User=anri
+Group=anri
+WorkingDirectory=/home/anri/LLM_setup_for_george/gateway
+Environment=PATH=/home/anri/.nvm/versions/node/v24.12.0/bin:/home/anri/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/home/anri
+# The CLI is gone; make sure no inherited Claude Code env leaks in.
+UnsetEnvironment=CLAUDECODE
+
+Environment=BRIDGE_NAME=electrobrain
+Environment=BRIDGE_SOCKET=/home/anri/LLM_setup_for_george/run/electrobrain-bridge.sock
+Environment=BRIDGE_STATE=/home/anri/LLM_setup_for_george/run/electrobrain-state.json
+# Must match what the bot container sweeps (it sees run/ as /run/claude-bridge).
+Environment=BRIDGE_PENDING_DIR=/home/anri/LLM_setup_for_george/run/pending
+Environment=BRIDGE_WORKDIR=/home/anri/LLM_setup_for_george/bot
+Environment=BRIDGE_SPAWN=["python3","/home/anri/LLM_setup_for_george/bot/ask.py","-p","{message}"]
+# stdout of ask.py IS the reply - no stream-json to parse.
+Environment=BRIDGE_OUTPUT=plain
+Environment=BRIDGE_ENGINE_STATE=/home/anri/LLM_setup_for_george/state/ask-history.json
+Environment=BRIDGE_MAX_RUNTIME_MS=900000
+Environment=STANDARDS_ROOT=/home/anri/LLM_setup_for_george
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUTF8=1
+# Secrets (ANTHROPIC_API_KEY, and nothing else) come from a gitignored file.
+EnvironmentFile=/home/anri/LLM_setup_for_george/secrets.env
+
+ExecStartPre=/bin/bash -c 'mkdir -p /home/anri/LLM_setup_for_george/run/pending && rm -f /home/anri/LLM_setup_for_george/run/electrobrain-bridge.sock'
+ExecStart=/home/anri/.nvm/versions/node/v24.12.0/bin/node /home/anri/LLM_setup_for_george/gateway/bridge-server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

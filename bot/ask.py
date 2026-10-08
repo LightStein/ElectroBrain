@@ -807,6 +807,72 @@ def found_sources(chunks, titles):
     return "\n".join(out)
 
 
+DOC_EXTS = {".pdf", ".docx", ".doc", ".odt", ".xodt"}
+ATTACH_RE = re.compile(r"\[(?:File|Image) attached:\s*([^\]]+?)(?:\s*\(([^)]*)\))?\]")
+
+
+def attached_documents(question):
+    """Standards documents George sent to the chat, as (path, display name).
+
+    The bot downloads an upload into its container and passes the HOST path in
+    the prompt text, so the bridge - which runs on the host - can open it
+    directly. With staging on, several files plus a caption arrive as one turn,
+    which is what makes "here are 3 PDFs" a single ingestion.
+    """
+    out = []
+    for path, name in ATTACH_RE.findall(question):
+        path = path.strip()
+        if os.path.splitext(path)[1].lower() in DOC_EXTS and os.path.isfile(path):
+            out.append((path, (name or os.path.basename(path)).strip()))
+    return out
+
+
+def ingest_documents(docs):
+    """Copy into the corpus and reindex. Replaces George's Update-Standards.bat.
+
+    Adding a document used to mean putting it in a folder on his laptop and
+    double-clicking a .bat. Sending it to the chat he already asks questions in
+    is one less thing to explain, and it is the same path the questions take.
+    """
+    import shutil
+    import subprocess
+
+    raw = os.environ.get("STANDARDS_RAW", os.path.join(ROOT, "corpus"))
+    os.makedirs(raw, exist_ok=True)
+    added = []
+    for path, name in docs:
+        safe = re.sub(r"[\\/:*?\"<>|]", "_", name) or os.path.basename(path)
+        dest = os.path.join(raw, safe)
+        try:
+            # EACCES on a file that exists means the Bot API server's 0640
+            # root:root download mode; the bot chmods 0644 on download, so this
+            # should not happen - but say which file if it does.
+            shutil.copyfile(path, dest)
+            added.append(safe)
+        except OSError as e:
+            log("ingest copy failed for %s: %s" % (name, e))
+            return ("Не смог прочитать файл «%s»: %s\n"
+                    "Перешли его ещё раз или напиши Анри." % (name, e))
+    if not added:
+        return "Не нашёл, что добавить."
+
+    progress("📥 Добавляю %d док. в базу — это займёт минуту…" % len(added))
+    env = dict(os.environ)
+    env.update({"STANDARDS_ROOT": ROOT, "STANDARDS_RAW": raw,
+                "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+    r = subprocess.run([sys.executable,
+                        os.path.join(ROOT, "pipeline", "update.py")],
+                       capture_output=True, text=True, encoding="utf-8",
+                       cwd=ROOT, env=env, timeout=3600)
+    if r.returncode != 0:
+        log("pipeline failed: %s" % (r.stderr or "")[-600:])
+        return ("Файл сохранил, но не смог построить индекс. "
+                "Напиши Анри — он посмотрит.\n\n" + ", ".join(added))
+    total = len(os.listdir(DOCS_DIR)) if os.path.isdir(DOCS_DIR) else 0
+    return ("Готово. Добавил:\n• " + "\n• ".join(added)
+            + "\n\nВсего документов в базе: %d. Можно спрашивать." % total)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--prompt", required=True)
@@ -824,6 +890,18 @@ def main():
     question = re.sub(r"^(\[From:[^\]]*\]\s*)?(\[Replying[^\]]*\]\s*)*PRO:\s*",
                       lambda m: m.group(0).replace("PRO:", "").rstrip(),
                       question, count=1)
+
+    # A document sent to the chat is an index request, not a question. Handled
+    # before routing because there is nothing to retrieve from yet, and the
+    # bridge serialises turns, so this cannot race a question mid-reindex.
+    docs = attached_documents(question)
+    if docs:
+        reply = ingest_documents(docs)
+        print(reply)
+        log_answer(question, reply, None, [], "ingest")
+        history.append({"q": "[добавление документов]", "a": reply})
+        save_history(history)
+        return
 
     catalog_text, titles = load_catalog()
     if not catalog_text:
