@@ -74,11 +74,23 @@ CASES = [
     },
     {
         "q": "какого цвета PEN проводник?",
-        "right": r"голуб\w*[^.]{0,80}(ж[ёе]лто-?зел|зел[ёе]но-?ж[ёе]лт)|"
-                 r"(ж[ёе]лто-?зел|зел[ёе]но-?ж[ёе]лт)[^.]{0,80}голуб",
-        "wrong": r"^(?!.*голуб).*(?:только\s+)?ж[ёе]лто-?зел",
-        "why": "PEN is the combined case and needs BOTH: blue along its length "
-               "with yellow-green marks at the ends. Naming one alone is wrong.",
+        # Two valid conventions live in this corpus and the answer may cite
+        # either: ПУЭ gives blue along the length with yellow-green at the
+        # ends; И 1.00-12 allows that OR the inverse. So the test is that BOTH
+        # colours appear, in either order - not one fixed phrasing.
+        #
+        # This pattern previously accepted only "голубой" for blue and failed
+        # a correct answer that said "синий". Both words mean blue here, and
+        # encoding one document's vocabulary as the only truth is the same
+        # mistake the refusal phrase-list made earlier in this file.
+        "right": r"(?:голуб|син)\w*[\s\S]{0,160}(?:ж[ёе]лто-?зел|зел[ёе]но-?ж[ёе]лт)|"
+                 r"(?:ж[ёе]лто-?зел|зел[ёе]но-?ж[ёе]лт)[\s\S]{0,160}(?:голуб|син)",
+        # Fires when exactly ONE colour family is named - either way round.
+        # `right` is tested first, so anything naming both never reaches here.
+        "wrong": r"^(?![\s\S]*(?:ж[ёе]лто-?зел|зел[ёе]но-?ж[ёе]лт))[\s\S]*(?:голуб|син)"
+                 r"|^(?![\s\S]*(?:голуб|син))[\s\S]*(?:ж[ёе]лто-?зел|зел[ёе]но-?ж[ёе]лт)",
+        "why": "PEN is the combined case and needs BOTH colours named. Giving "
+               "only one is wrong, whichever convention is cited.",
         "source": "corpus-grep",
         "cite": "ПУЭ: «буквенное обозначение PEN и цветовое обозначение: "
                 "голубой цвет по всей длине и желто-зеленые полосы на концах»",
