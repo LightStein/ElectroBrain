@@ -914,8 +914,10 @@ def main():
 
     catalog_text, titles = load_catalog()
     if not catalog_text:
-        print("Индекс ещё не построен (index/catalog.md отсутствует). "
-              "Запусти Update-Standards или обратись к Анри.")
+        # Adding a document is now "send it to this chat", not a .bat on a
+        # laptop, so the empty-index message has to say that.
+        print("База документов пока пустая. Пришли сюда файлы стандартов "
+              "(PDF, DOC, DOCX) — я их добавлю, и можно будет спрашивать.")
         return
 
     terms, doc_ids = route_lexical(question, load_meta_index())

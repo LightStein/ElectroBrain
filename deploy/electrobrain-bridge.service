@@ -28,7 +28,12 @@ Environment=BRIDGE_STATE=/home/anri/LLM_setup_for_george/run/electrobrain-state.
 # Must match what the bot container sweeps (it sees run/ as /run/claude-bridge).
 Environment=BRIDGE_PENDING_DIR=/home/anri/LLM_setup_for_george/run/pending
 Environment=BRIDGE_WORKDIR=/home/anri/LLM_setup_for_george/bot
-Environment=BRIDGE_SPAWN=["python3","/home/anri/LLM_setup_for_george/bot/ask.py","-p","{message}"]
+# systemd strips bare double quotes from Environment= values, exactly as
+# nssm did on Windows, which left the bridge a JSON array with no quotes
+# and it refused to start. Quote the whole assignment and escape the
+# inner quotes. The interpreter is the venv's, not system python3 -
+# that one has no anthropic SDK.
+Environment="BRIDGE_SPAWN=[\"/home/anri/LLM_setup_for_george/.venv/bin/python\",\"/home/anri/LLM_setup_for_george/bot/ask.py\",\"-p\",\"{message}\"]"
 # stdout of ask.py IS the reply - no stream-json to parse.
 Environment=BRIDGE_OUTPUT=plain
 Environment=BRIDGE_ENGINE_STATE=/home/anri/LLM_setup_for_george/state/ask-history.json
